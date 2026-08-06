@@ -3,40 +3,41 @@ use std::fmt;
 #[derive(Debug)]
 pub enum SentinelError {
     ParseError(String),
-    IoError(std::io::Error),
+    Io(String),
     DatabaseError(String),
     ConfigError(String),
     AuthError(String),
     FileTailingError(String),
     ServiceError(String),
+    Internal(String),
 }
 
 impl fmt::Display for SentinelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SentinelError::ParseError(msg) => write!(f, "parse error: {msg}"),
-            SentinelError::IoError(err) => write!(f, "IO error: {err}"),
+            SentinelError::Io(msg) => write!(f, "IO error: {msg}"),
             SentinelError::DatabaseError(msg) => write!(f, "database error: {msg}"),
             SentinelError::ConfigError(msg) => write!(f, "config error: {msg}"),
             SentinelError::AuthError(msg) => write!(f, "auth error: {msg}"),
             SentinelError::FileTailingError(msg) => write!(f, "file tailing error: {msg}"),
             SentinelError::ServiceError(msg) => write!(f, "service error: {msg}"),
+            SentinelError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for SentinelError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SentinelError::IoError(err) => Some(err),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for SentinelError {}
 
 impl From<std::io::Error> for SentinelError {
     fn from(err: std::io::Error) -> Self {
-        SentinelError::IoError(err)
+        SentinelError::Io(err.to_string())
+    }
+}
+
+impl From<std::string::FromUtf8Error> for SentinelError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        SentinelError::Io(err.to_string())
     }
 }
 
@@ -56,8 +57,8 @@ mod tests {
         let std_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err: SentinelError = std_err.into();
         match err {
-            SentinelError::IoError(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
-            _ => panic!("Expected IoError"),
+            SentinelError::Io(msg) => assert!(msg.contains("file not found")),
+            _ => panic!("Expected Io"),
         }
     }
 
@@ -93,9 +94,8 @@ mod tests {
 
     #[test]
     fn test_error_source_chain() {
-        let inner = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
-        let err: SentinelError = inner.into();
-        assert!(err.source().is_some());
+        let err = SentinelError::ParseError("test".to_string());
+        assert!(err.source().is_none());
     }
 
     #[test]

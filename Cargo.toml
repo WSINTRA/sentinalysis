@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
 
 # Web framework
 actix-web = { version = "4", features = ["rustls-0_23"] }
@@ -30,6 +32,7 @@ sysinfo = "0.33"
 
 # File watching (uses inotify on Linux)
 notify = "7"
+crossbeam-channel = "0.5"
 
 # Log parsing
 regex = "1"
