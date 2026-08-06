@@ -14,10 +14,11 @@
 - [x] NginxAccessParser (src/log_scanner/parser/nginx.rs) - 25 tests
 - [x] AuthLogParser (src/log_scanner/parser/auth.rs) - 14 tests
 - [x] NoiseFilter with security detection (src/log_scanner/filter.rs) - 27 tests
+- [x] Threat Classifier (src/log_scanner/classifier.rs) - 38 tests
+- [x] FileTailer with notify-based watching (src/log_scanner/tailer.rs) - 11 tests
 
 ### In Progress
 
-- [ ] FileTailer (src/log_scanner/tailer.rs)
 - [ ] Scanner orchestrator (src/log_scanner/mod.rs)
 - [ ] Configuration loading (src/config.rs)
 - [ ] Database pool setup (src/db/pool.rs)
@@ -36,6 +37,7 @@ None.
 ### Notes
 
 - Using `notify` crate instead of `inotify` (cross-platform, uses inotify on Linux)
-- 75 tests passing total
+- 123 tests passing total (1 ignored: flaky FSEvents on macOS)
 - Clippy clean, rustfmt applied
 - TDD workflow established: tests first, clippy/fmt on every commit
+- FileTailer uses crossbeam-channel for thread-safe notify bridging
