@@ -1,6 +1,6 @@
 # PROGRESS.md - Sentinel Development Progress
 
-## Status: Phase 1 - Foundation
+## Status: Phase 2 - Log Scanner Core
 
 ### Completed
 
@@ -9,22 +9,24 @@
 - [x] Dependencies configured in Cargo.toml
 - [x] Git repository initialized
 - [x] Project structure created
+- [x] Error types implementation (src/error.rs) - 9 tests
+- [x] LogParser trait and types (src/log_scanner/parser/mod.rs)
+- [x] NginxAccessParser (src/log_scanner/parser/nginx.rs) - 25 tests
+- [x] AuthLogParser (src/log_scanner/parser/auth.rs) - 14 tests
 
 ### In Progress
 
-- [ ] Error types implementation (src/error.rs)
-- [ ] Configuration loading (src/config.rs)
-- [ ] Database pool setup (src/db/pool.rs)
-- [ ] SQL migrations
+- [ ] NoiseFilter (src/log_scanner/filter.rs)
+- [ ] Classifier (src/log_scanner/classifier.rs)
+- [ ] FileTailer (src/log_scanner/tailer.rs)
+- [ ] Scanner orchestrator
 
 ### Next Steps
 
-1. Implement `SentinelError` enum with thiserror
-2. Write tests for error conversions
-3. Implement config.rs with serde_yaml
-4. Write tests for config loading
-5. Set up sqlx with Postgres
-6. Create initial migrations
+1. Implement NoiseFilter with configurable rules
+2. Implement Classifier for security pattern detection
+3. Implement FileTailer with notify crate
+4. Wire up scanner orchestrator
 
 ### Blockers
 
@@ -32,7 +34,6 @@ None.
 
 ### Notes
 
-- Using TLS + API key auth (mTLS deferred)
-- Linux-only target (inotify for file tailing)
-- Postgres for database (existing on server)
-- systemctl parsing for service discovery
+- Using `notify` crate instead of `inotify` (cross-platform, uses inotify on Linux)
+- 48 tests passing total
+- Clippy clean, rustfmt applied
