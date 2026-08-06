@@ -13,20 +13,21 @@
 - [x] LogParser trait and types (src/log_scanner/parser/mod.rs)
 - [x] NginxAccessParser (src/log_scanner/parser/nginx.rs) - 25 tests
 - [x] AuthLogParser (src/log_scanner/parser/auth.rs) - 14 tests
+- [x] NoiseFilter with security detection (src/log_scanner/filter.rs) - 27 tests
 
 ### In Progress
 
-- [ ] NoiseFilter (src/log_scanner/filter.rs)
-- [ ] Classifier (src/log_scanner/classifier.rs)
 - [ ] FileTailer (src/log_scanner/tailer.rs)
-- [ ] Scanner orchestrator
+- [ ] Scanner orchestrator (src/log_scanner/mod.rs)
+- [ ] Configuration loading (src/config.rs)
+- [ ] Database pool setup (src/db/pool.rs)
 
 ### Next Steps
 
-1. Implement NoiseFilter with configurable rules
-2. Implement Classifier for security pattern detection
-3. Implement FileTailer with notify crate
-4. Wire up scanner orchestrator
+1. Implement FileTailer with notify crate
+2. Wire up scanner orchestrator (parse -> filter -> classify -> store)
+3. Implement config.rs with serde_yaml
+4. Set up sqlx with Postgres and migrations
 
 ### Blockers
 
@@ -35,5 +36,6 @@ None.
 ### Notes
 
 - Using `notify` crate instead of `inotify` (cross-platform, uses inotify on Linux)
-- 48 tests passing total
+- 75 tests passing total
 - Clippy clean, rustfmt applied
+- TDD workflow established: tests first, clippy/fmt on every commit
