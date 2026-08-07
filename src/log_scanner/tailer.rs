@@ -1,9 +1,13 @@
 use crate::error::SentinelError;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, Sender as CrossbeamSender, TrySendError};
 use notify::{Config, Event, EventHandler, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::mpsc::{self, Receiver as TokioReceiver, Sender as TokioSender};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 pub type TailEvent = Result<TailLine, SentinelError>;
 
@@ -14,21 +18,42 @@ pub struct TailLine {
     pub byte_offset: u64,
 }
 
-#[derive(Debug, Default)]
 pub struct FileTailer {
     watcher: Option<RecommendedWatcher>,
     files: Vec<PathBuf>,
+    rt: tokio::runtime::Handle,
     cancel_token: CancellationToken,
     started: bool,
 }
 
+impl Default for FileTailer {
+    fn default() -> Self {
+        Self {
+            watcher: None,
+            files: Vec::new(),
+            rt: tokio::runtime::Handle::current(),
+            cancel_token: CancellationToken::new(),
+            started: false,
+        }
+    }
+}
+
 struct ChannelHandler {
-    sender: crossbeam_channel::Sender<notify::Result<Event>>,
+    sender: CrossbeamSender<notify::Result<Event>>,
 }
 
 impl EventHandler for ChannelHandler {
     fn handle_event(&mut self, event: notify::Result<Event>) {
-        let _ = self.sender.send(event);
+        if let Err(e) = self.sender.try_send(event) {
+            match e {
+                TrySendError::Full(ev) => {
+                    warn!("notify channel full, dropping event: {:?}", ev);
+                }
+                TrySendError::Disconnected(_) => {
+                    warn!("notify channel disconnected, dropping event");
+                }
+            }
+        }
     }
 }
 
@@ -75,34 +100,39 @@ impl FileTailer {
         self.watcher = Some(watcher);
         self.started = true;
 
-        // Spawn a thread to bridge blocking notify receiver to async channel
-        let (async_tx, mut async_rx) = mpsc::channel::<notify::Result<Event>>(128);
+        let (bridge_tx, bridge_rx) = bounded::<notify::Result<Event>>(128);
         std::thread::spawn(move || {
             while let Ok(event) = std_rx.recv() {
-                let rt = match tokio::runtime::Handle::try_current() {
-                    Ok(h) => h,
-                    Err(_) => tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .handle()
-                        .clone(),
-                };
-                let should_break = rt.block_on(async {
-                    #[allow(clippy::unused_async)]
-                    async_tx.send(event).await.is_err()
-                });
-                if should_break {
-                    break;
+                match bridge_tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        warn!("bridge channel full, dropping event");
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        break;
+                    }
                 }
             }
+        });
+
+        let (async_tx, mut async_rx) = mpsc::channel::<notify::Result<Event>>(128);
+        let rt = self.rt.clone();
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                while let Ok(event) = bridge_rx.recv() {
+                    let tx = async_tx.clone();
+                    std::mem::drop(rt.spawn(async move {
+                        let _ = tx.send(event).await;
+                    }));
+                }
+            })
+            .await;
         });
 
         tokio::spawn(async move {
             let mut positions: std::collections::HashMap<PathBuf, u64> =
                 std::collections::HashMap::new();
 
-            // Initial read of existing content
             for file in &files {
                 if let Err(e) = read_existing_lines(file, &mut positions, &tx).await {
                     let _ = tx.send(Err(e)).await;
@@ -189,40 +219,37 @@ async fn handle_event(
             EventKind::Modify(notify::event::ModifyKind::Data(_))
         ) {
             if let Some(&pos) = positions.get(&path) {
-                let content = tokio::fs::read_to_string(&path)
+                let mut file = File::open(&path)
                     .await
                     .map_err(|e| SentinelError::Io(e.to_string()))?;
-                let bytes = content.as_bytes();
 
-                let pos_usize = usize::try_from(pos).map_err(|_| {
-                    SentinelError::Internal("File position exceeds address space".into())
-                })?;
+                file.seek(SeekFrom::Start(pos))
+                    .await
+                    .map_err(|e| SentinelError::Io(e.to_string()))?;
 
-                if bytes.len() >= pos_usize {
-                    let new_content = &bytes[pos_usize..];
-                    let text = std::str::from_utf8(new_content)
-                        .map_err(|e| SentinelError::Io(e.to_string()))?;
-                    let mut current_offset = pos;
+                let mut new_content = String::new();
+                file.read_to_string(&mut new_content)
+                    .await
+                    .map_err(|e| SentinelError::Io(e.to_string()))?;
 
-                    for line in text.lines() {
-                        let line_bytes = line.len() as u64 + 1;
-                        let tail_line = TailLine {
-                            file_path: path.clone(),
-                            line: line.to_string(),
-                            byte_offset: current_offset,
-                        };
+                let mut current_offset = pos;
 
-                        if tx.send(Ok(tail_line)).await.is_err() {
-                            return Ok(());
-                        }
+                for line in new_content.lines() {
+                    let line_bytes = line.len() as u64 + 1;
+                    let tail_line = TailLine {
+                        file_path: path.clone(),
+                        line: line.to_string(),
+                        byte_offset: current_offset,
+                    };
 
-                        current_offset += line_bytes;
+                    if tx.send(Ok(tail_line)).await.is_err() {
+                        return Ok(());
                     }
 
-                    positions.insert(path.clone(), current_offset);
-                } else {
-                    positions.insert(path.clone(), 0);
+                    current_offset += line_bytes;
                 }
+
+                positions.insert(path.clone(), current_offset);
             }
         } else if matches!(event.kind, EventKind::Create(_)) {
             positions.insert(path.clone(), 0);
