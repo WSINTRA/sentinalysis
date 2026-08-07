@@ -120,10 +120,9 @@ impl FileTailer {
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
                 while let Ok(event) = bridge_rx.recv() {
-                    let tx = async_tx.clone();
-                    std::mem::drop(rt.spawn(async move {
-                        let _ = tx.send(event).await;
-                    }));
+                    if rt.block_on(async_tx.send(event)).is_err() {
+                        break;
+                    }
                 }
             })
             .await;
