@@ -20,7 +20,7 @@ impl Default for NginxAccessParser {
 
 static NGINX_COMBINED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^(?P<remote_addr>\S+) \S+ \S+ \[(?P<time_local>[^\]]+)\] "(?P<request>[^"]*)" (?P<status>\d{3}) (?P<body_bytes_sent>\d+) "(?P<http_referer>[^"]*)" "(?P<http_user_agent>[^"]*)"$"#,
+        r#"^(?P<remote_addr>\S+) \S+ \S+ \[(?P<time_local>[^\]]+)\] "(?P<request>[^"]*)" (?P<status>\d{3}) (?P<body_bytes_sent>\d+) "(?P<http_referer>[^"]*)" "(?P<http_user_agent>[^"]*)" "(?P<host>[^"]*)" (?P<request_time>[\d.]+)$"#,
     )
     .expect("hardcoded nginx combined log regex must be valid")
 });
@@ -83,7 +83,20 @@ impl LogParser for NginxAccessParser {
 
         let level = classify_status(status);
 
-        let virtual_host = extract_virtual_host(path.clone());
+        let virtual_host = Some(caps.name("host").unwrap().as_str().to_string());
+
+        let request_time: f64 = caps
+            .name("request_time")
+            .unwrap()
+            .as_str()
+            .parse()
+            .map_err(|_| ParseError::InvalidValue {
+                field: "request_time".to_string(),
+                value: caps.name("request_time").unwrap().as_str().to_string(),
+            })?;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let response_time_ms = (request_time * 1000.0).round() as u64;
 
         let metadata = LogMetadata {
             client_ip: Some(remote_addr),
@@ -91,7 +104,7 @@ impl LogParser for NginxAccessParser {
             request_path: path.clone(),
             status_code: Some(status),
             bytes_sent: Some(bytes_sent),
-            response_time_ms: None,
+            response_time_ms: Some(response_time_ms),
             user_agent: Some(caps.name("http_user_agent").unwrap().as_str().to_string()),
             referer: Some(caps.name("http_referer").unwrap().as_str().to_string()),
             virtual_host,
@@ -135,13 +148,6 @@ fn classify_status(status: u16) -> LogLevel {
     }
 }
 
-fn extract_virtual_host(_path: Option<String>) -> Option<String> {
-    // Virtual host is typically extracted from the $host variable in nginx logs.
-    // In combined format without $host, we'd need it in a custom log format.
-    // For now, return None - will be populated from nginx error logs or config.
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +178,7 @@ mod tests {
     #[test]
     fn test_parse_valid_combined_log_format() {
         let parser = NginxAccessParser::new();
-        let line = "192.168.1.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /api/health HTTP/1.1\" 200 15 \"-\" \"curl/8.0\"";
+        let line = "192.168.1.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /api/health HTTP/1.1\" 200 15 \"-\" \"curl/8.0\" \"api.example.com\" 0.123";
         let entry = parser.parse(line).unwrap().unwrap();
 
         assert_eq!(
@@ -184,6 +190,11 @@ mod tests {
         assert_eq!(entry.metadata.status_code, Some(200));
         assert_eq!(entry.metadata.bytes_sent, Some(15));
         assert_eq!(entry.metadata.user_agent, Some("curl/8.0".to_string()));
+        assert_eq!(
+            entry.metadata.virtual_host,
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(entry.metadata.response_time_ms, Some(123));
         assert_eq!(entry.level, LogLevel::Info);
         assert_eq!(entry.source_name, "nginx-access");
     }
@@ -191,8 +202,7 @@ mod tests {
     #[test]
     fn test_parse_ipv6_address() {
         let parser = NginxAccessParser::new();
-        let line =
-            "::1 - - [01/Jan/2025:00:00:00 +0000] \"GET / HTTP/1.1\" 200 100 \"-\" \"Mozilla/5.0\"";
+        let line = "::1 - - [01/Jan/2025:00:00:00 +0000] \"GET / HTTP/1.1\" 200 100 \"-\" \"Mozilla/5.0\" \"localhost\" 0.001";
         let entry = parser.parse(line).unwrap().unwrap();
 
         assert_eq!(
@@ -204,8 +214,7 @@ mod tests {
     #[test]
     fn test_parse_500_status_is_error_level() {
         let parser = NginxAccessParser::new();
-        let line =
-            "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /fail HTTP/1.1\" 500 0 \"-\" \"test\"";
+        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /fail HTTP/1.1\" 500 0 \"-\" \"test\" \"app.example.com\" 1.234";
         let entry = parser.parse(line).unwrap().unwrap();
 
         assert_eq!(entry.level, LogLevel::Error);
@@ -215,7 +224,7 @@ mod tests {
     #[test]
     fn test_parse_404_status_is_warn_level() {
         let parser = NginxAccessParser::new();
-        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /missing HTTP/1.1\" 404 0 \"-\" \"test\"";
+        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /missing HTTP/1.1\" 404 0 \"-\" \"test\" \"app.example.com\" 0.005";
         let entry = parser.parse(line).unwrap().unwrap();
 
         assert_eq!(entry.level, LogLevel::Warn);
@@ -225,8 +234,7 @@ mod tests {
     #[test]
     fn test_parse_301_status_is_info_level() {
         let parser = NginxAccessParser::new();
-        let line =
-            "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /old HTTP/1.1\" 301 0 \"-\" \"test\"";
+        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /old HTTP/1.1\" 301 0 \"-\" \"test\" \"app.example.com\" 0.002";
         let entry = parser.parse(line).unwrap().unwrap();
 
         assert_eq!(entry.level, LogLevel::Info);
@@ -235,7 +243,7 @@ mod tests {
     #[test]
     fn test_parse_with_referer() {
         let parser = NginxAccessParser::new();
-        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /page HTTP/1.1\" 200 100 \"https://example.com\" \"Mozilla/5.0\"";
+        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /page HTTP/1.1\" 200 100 \"https://example.com\" \"Mozilla/5.0\" \"app.example.com\" 0.050";
         let entry = parser.parse(line).unwrap().unwrap();
 
         assert_eq!(
@@ -247,8 +255,7 @@ mod tests {
     #[test]
     fn test_parse_timestamp_with_timezone() {
         let parser = NginxAccessParser::new();
-        let line =
-            "10.0.0.1 - - [15/Mar/2025:10:30:45 +0530] \"GET / HTTP/1.1\" 200 10 \"-\" \"test\"";
+        let line = "10.0.0.1 - - [15/Mar/2025:10:30:45 +0530] \"GET / HTTP/1.1\" 200 10 \"-\" \"test\" \"app.example.com\" 0.100";
         let entry = parser.parse(line).unwrap().unwrap();
 
         // 10:30:45 +0530 = 05:00:45 UTC
@@ -267,8 +274,7 @@ mod tests {
     #[test]
     fn test_parse_invalid_ip_returns_error() {
         let parser = NginxAccessParser::new();
-        let line =
-            "not-an-ip - - [01/Jan/2025:00:00:00 +0000] \"GET / HTTP/1.1\" 200 10 \"-\" \"test\"";
+        let line = "not-an-ip - - [01/Jan/2025:00:00:00 +0000] \"GET / HTTP/1.1\" 200 10 \"-\" \"test\" \"app.example.com\" 0.001";
         let result = parser.parse(line);
         assert!(result.is_err());
     }
@@ -284,7 +290,7 @@ mod tests {
     fn test_parse_various_http_methods(#[case] method: &str) {
         let parser = NginxAccessParser::new();
         let line = format!(
-            r#"10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] "{} /test HTTP/1.1" 200 10 "-" "test""#,
+            r#"10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] "{} /test HTTP/1.1" 200 10 "-" "test" "app.example.com" 0.001"#,
             method
         );
         let entry = parser.parse(&line).unwrap().unwrap();
@@ -294,7 +300,7 @@ mod tests {
     #[test]
     fn test_parse_large_body_bytes() {
         let parser = NginxAccessParser::new();
-        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /file HTTP/1.1\" 200 999999999 \"-\" \"test\"";
+        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /file HTTP/1.1\" 200 999999999 \"-\" \"test\" \"app.example.com\" 2.500";
         let entry = parser.parse(line).unwrap().unwrap();
         assert_eq!(entry.metadata.bytes_sent, Some(999999999));
     }
@@ -302,8 +308,7 @@ mod tests {
     #[test]
     fn test_parse_preserves_raw_line() {
         let parser = NginxAccessParser::new();
-        let line =
-            "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET / HTTP/1.1\" 200 10 \"-\" \"test\"";
+        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET / HTTP/1.1\" 200 10 \"-\" \"test\" \"app.example.com\" 0.001";
         let entry = parser.parse(line).unwrap().unwrap();
         assert_eq!(entry.raw, line);
     }
@@ -311,7 +316,7 @@ mod tests {
     #[test]
     fn test_message_contains_request_info() {
         let parser = NginxAccessParser::new();
-        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /api/users HTTP/1.1\" 200 100 \"-\" \"test\"";
+        let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /api/users HTTP/1.1\" 200 100 \"-\" \"test\" \"app.example.com\" 0.050";
         let entry = parser.parse(line).unwrap().unwrap();
         assert!(entry.message.contains("GET"));
         assert!(entry.message.contains("/api/users"));

@@ -34,6 +34,12 @@ sysinfo = "0.33"
 notify = "7"
 crossbeam-channel = "0.5"
 
+# Systemd journal
+sdjournal = "0.1"
+
+# Glob pattern matching
+glob = "0.3"
+
 # Log parsing
 regex = "1"
 
