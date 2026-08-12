@@ -63,6 +63,16 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Rate limiting
 governor = "0.8"
 
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Enum utilities
+strum = { version = "0.26", features = ["derive"] }
+
 [dev-dependencies]
 rstest = "0.24"
 proptest = "1"
