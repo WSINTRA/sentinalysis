@@ -53,7 +53,7 @@ CREATE INDEX idx_system_metrics_timestamp ON system_metrics(timestamp DESC);
 -- Active sessions table
 CREATE TABLE active_sessions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user TEXT NOT NULL,
+    "user" TEXT NOT NULL,
     terminal TEXT NOT NULL,
     source_ip INET,
     login_time TIMESTAMPTZ NOT NULL,
