@@ -67,6 +67,9 @@ governor = "0.8"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
+# Environment variables
+dotenvy = "0.15"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

@@ -24,13 +24,23 @@ pub async fn health_check(pool: &PgPool) -> Result<(), SentinelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[tokio::test]
     async fn test_create_pool_missing_env_fails() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var("DATABASE_URL").ok();
         unsafe {
             std::env::remove_var("DATABASE_URL");
         }
         let result = create_pool().await;
+        if let Some(val) = original {
+            unsafe {
+                std::env::set_var("DATABASE_URL", val);
+            }
+        }
         assert!(result.is_err());
         match result {
             Err(SentinelError::ConfigError(msg)) => {
@@ -42,10 +52,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_pool_invalid_url_fails() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var("DATABASE_URL").ok();
         unsafe {
             std::env::set_var("DATABASE_URL", "postgresql://invalid:5432/nonexistent");
         }
         let result = create_pool().await;
+        match original {
+            Some(val) => unsafe { std::env::set_var("DATABASE_URL", val) },
+            None => unsafe { std::env::remove_var("DATABASE_URL") },
+        }
         assert!(result.is_err());
         match result {
             Err(SentinelError::DatabaseError(_)) => {}

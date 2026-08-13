@@ -42,6 +42,7 @@ async fn main() {
 
 async fn run() -> Result<(), SentinelError> {
     let cli = Cli::parse();
+    load_dotenv();
     init_tracing();
 
     let config = load_config(&cli.config)?;
@@ -67,4 +68,12 @@ async fn run_tui(pool: sqlx::PgPool, config: Config) -> Result<(), SentinelError
     let mut tui = sentinel::tui::Tui::new()?;
 
     tui.run(app).await
+}
+
+fn load_dotenv() {
+    if let Err(e) = dotenvy::from_filename(".env")
+        && !matches!(e, dotenvy::Error::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
+    {
+        eprintln!("Warning: failed to load .env: {e}");
+    }
 }
