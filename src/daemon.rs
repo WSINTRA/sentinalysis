@@ -69,7 +69,7 @@ async fn daemon_loop(
     let mut tailer = FileTailer::new();
 
     for dir_config in &config.log_watching.directories {
-        tailer = tailer.with_watch_directory(dir_config.path.clone(), &dir_config.pattern);
+        tailer = tailer.with_watch_directory(dir_config.path.clone(), &dir_config.pattern)?;
     }
 
     if !config.log_watching.files.is_empty() {

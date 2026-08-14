@@ -1,19 +1,32 @@
-use crate::error::SentinelError;
+//! File tailing for the log scanner.
+//!
+//! `FileTailer` watches explicit files and directories (with glob
+//! patterns) using the `notify` crate, reads existing content on start,
+//! follows appended data, adopts newly created logs, and handles
+//! rotation (`access.log` → `access.log.1`).
+//!
+//! It emits `TailLine`s (path + line + byte offset) over a tokio channel.
+//! The per-file state machine (resume offsets, adopted files, event
+//! reactions) lives in [`state::TailerState`].
+
+mod state;
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use crossbeam_channel::{Sender as CrossbeamSender, TrySendError, bounded};
 use glob::Pattern;
-use notify::{Config, Event, EventHandler, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
-use std::io::SeekFrom;
-use std::path::{Path, PathBuf};
-
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::mpsc::{self, Receiver as TokioReceiver, Sender as TokioSender};
+use notify::{Config, Event, EventHandler, RecommendedWatcher, RecursiveMode, Watcher};
+use tokio::sync::mpsc::{self, Receiver as TokioReceiver};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-pub type TailEvent = Result<TailLine, SentinelError>;
+pub use state::TailerState;
 
+use crate::error::SentinelError;
+
+/// One tailed line: which file it came from, its text, and the byte
+/// offset where it started in that file.
 #[derive(Debug, Clone)]
 pub struct TailLine {
     pub file_path: PathBuf,
@@ -21,6 +34,10 @@ pub struct TailLine {
     pub byte_offset: u64,
 }
 
+/// A tailed line or the error that stopped production.
+pub type TailEvent = Result<TailLine, SentinelError>;
+
+/// A watched directory plus the file-name glob to tail in it.
 #[derive(Debug, Clone)]
 pub struct LogWatchConfig {
     pub directory: PathBuf,
@@ -28,33 +45,18 @@ pub struct LogWatchConfig {
 }
 
 impl LogWatchConfig {
-    #[must_use]
-    pub fn new(directory: PathBuf, pattern: &str) -> Self {
-        Self {
-            directory,
-            pattern: Pattern::new(pattern).expect("log watch pattern must be valid glob"),
-        }
+    /// Compile the glob; an invalid pattern is a configuration error.
+    pub fn new(directory: PathBuf, pattern: &str) -> Result<Self, SentinelError> {
+        let pattern = Pattern::new(pattern).map_err(|e| {
+            SentinelError::ConfigError(format!("invalid log watch pattern '{pattern}': {e}"))
+        })?;
+        Ok(Self { directory, pattern })
     }
 }
 
-fn is_rotated_log(file_name: &str) -> bool {
-    if let Some(dot_pos) = file_name.rfind('.') {
-        let suffix = &file_name[dot_pos + 1..];
-        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
-    } else {
-        false
-    }
-}
-
-fn matches_pattern(path: &Path, pattern: &Pattern) -> bool {
-    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-        pattern.matches(file_name)
-    } else {
-        false
-    }
-}
-
+/// Watches log files/directories and emits their new lines.
 pub struct FileTailer {
+    /// Kept alive for the process lifetime; dropping it stops the watch.
     watcher: Option<RecommendedWatcher>,
     files: Vec<PathBuf>,
     watch_configs: Vec<LogWatchConfig>,
@@ -76,6 +78,7 @@ impl Default for FileTailer {
     }
 }
 
+/// Bridges `notify` (synchronous handler) onto a crossbeam channel.
 struct ChannelHandler {
     sender: CrossbeamSender<notify::Result<Event>>,
 }
@@ -85,7 +88,7 @@ impl EventHandler for ChannelHandler {
         if let Err(e) = self.sender.try_send(event) {
             match e {
                 TrySendError::Full(ev) => {
-                    warn!("notify channel full, dropping event: {:?}", ev);
+                    warn!("notify channel full, dropping event: {ev:?}");
                 }
                 TrySendError::Disconnected(_) => {
                     warn!("notify channel disconnected, dropping event");
@@ -101,19 +104,29 @@ impl FileTailer {
         Self::default()
     }
 
+    /// Tail these explicit files.
     #[must_use]
     pub fn with_files(mut self, files: Vec<PathBuf>) -> Self {
         self.files = files;
         self
     }
 
-    #[must_use]
-    pub fn with_watch_directory(mut self, directory: PathBuf, pattern: &str) -> Self {
+    /// Tail every file matching `pattern` (a glob on the file name) in
+    /// `directory`. Fails on an invalid pattern.
+    pub fn with_watch_directory(
+        mut self,
+        directory: PathBuf,
+        pattern: &str,
+    ) -> Result<Self, SentinelError> {
         self.watch_configs
-            .push(LogWatchConfig::new(directory, pattern));
-        self
+            .push(LogWatchConfig::new(directory, pattern)?);
+        Ok(self)
     }
 
+    /// Start the watcher and background tasks; returns the line stream.
+    ///
+    /// Initial content of all watched files/directories is read before
+    /// the first live event is delivered.
     #[allow(clippy::unused_async, clippy::too_many_lines)]
     pub async fn start(&mut self) -> Result<TokioReceiver<TailEvent>, SentinelError> {
         if self.started {
@@ -149,6 +162,7 @@ impl FileTailer {
         self.watcher = Some(watcher);
         self.started = true;
 
+        // Bridge: notify handler thread (sync) → tokio task (async).
         let (event_tx, mut event_rx) = mpsc::channel::<notify::Result<Event>>(128);
         let rt = self.rt.clone();
         tokio::spawn(async move {
@@ -166,23 +180,19 @@ impl FileTailer {
             .iter()
             .map(|cfg| cfg.directory.clone())
             .collect();
-        let initial_files: HashSet<PathBuf> = files.iter().cloned().collect();
 
+        // The tailing loop: initial read, then live events forever.
         tokio::spawn(async move {
-            let mut positions: std::collections::HashMap<PathBuf, u64> =
-                std::collections::HashMap::new();
-            let mut tailed_files: HashSet<PathBuf> = initial_files.clone();
+            let mut state = TailerState::new(files.clone());
 
             for file in &files {
-                if let Err(e) = read_existing_lines(file, &mut positions, &tx).await {
+                if let Err(e) = state.read_existing_lines(file, &tx).await {
                     let _ = tx.send(Err(e)).await;
                 }
             }
 
             for cfg in &watch_configs {
-                if let Err(e) =
-                    discover_existing_logs(cfg, &mut positions, &mut tailed_files, &tx).await
-                {
+                if let Err(e) = state.discover_existing_logs(cfg, &tx).await {
                     let _ = tx.send(Err(e)).await;
                 }
             }
@@ -196,14 +206,10 @@ impl FileTailer {
                             break;
                         };
 
-                        if let Err(e) = handle_event(
-                            event,
-                            &mut positions,
-                            &mut tailed_files,
-                            &watch_configs,
-                            &watched_dirs,
-                            &tx,
-                        ).await {
+                        if let Err(e) = state
+                            .handle_event(event, &watch_configs, &watched_dirs, &tx)
+                            .await
+                        {
                             let _ = tx.send(Err(e)).await;
                         }
                     }
@@ -214,6 +220,8 @@ impl FileTailer {
         Ok(rx)
     }
 
+    /// Stop the tailer; in-flight tasks exit on the next cancellation
+    /// check.
     pub fn stop(&self) {
         self.cancel_token.cancel();
     }
@@ -235,172 +243,11 @@ impl Drop for FileTailer {
     }
 }
 
-async fn read_existing_lines(
-    file: &Path,
-    positions: &mut std::collections::HashMap<PathBuf, u64>,
-    tx: &TokioSender<TailEvent>,
-) -> Result<(), SentinelError> {
-    let content = tokio::fs::read_to_string(file).await?;
-    let mut offset: u64 = 0;
-
-    for line in content.lines() {
-        let line_bytes = line.len() as u64 + 1;
-        let tail_line = TailLine {
-            file_path: file.to_path_buf(),
-            line: line.to_string(),
-            byte_offset: offset,
-        };
-
-        if tx.send(Ok(tail_line)).await.is_err() {
-            break;
-        }
-
-        offset += line_bytes;
-    }
-
-    positions.insert(file.to_path_buf(), offset);
-    Ok(())
-}
-
-async fn discover_existing_logs(
-    cfg: &LogWatchConfig,
-    positions: &mut std::collections::HashMap<PathBuf, u64>,
-    tailed_files: &mut HashSet<PathBuf>,
-    tx: &TokioSender<TailEvent>,
-) -> Result<(), SentinelError> {
-    let mut entries = tokio::fs::read_dir(&cfg.directory).await?;
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-
-        if !matches_pattern(&path, &cfg.pattern) || is_rotated_log(file_name) {
-            continue;
-        }
-
-        if tailed_files.insert(path.clone())
-            && let Err(e) = read_existing_lines(&path, positions, tx).await
-        {
-            warn!("failed to read existing lines from {:?}: {}", path, e);
-        }
-    }
-
-    Ok(())
-}
-
-async fn wait_for_file_stability(path: &Path) {
-    const MAX_CHECKS: usize = 10;
-    const CHECK_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(10);
-
-    let mut last_size = 0u64;
-    for _ in 0..MAX_CHECKS {
-        if let Ok(meta) = tokio::fs::metadata(path).await {
-            let size = meta.len();
-            if size == last_size && last_size > 0 {
-                return;
-            }
-            last_size = size;
-        }
-        tokio::time::sleep(CHECK_INTERVAL).await;
-    }
-}
-
-async fn handle_event(
-    event: Event,
-    positions: &mut std::collections::HashMap<PathBuf, u64>,
-    tailed_files: &mut HashSet<PathBuf>,
-    watch_configs: &[LogWatchConfig],
-    watched_dirs: &HashSet<PathBuf>,
-    tx: &TokioSender<TailEvent>,
-) -> Result<(), SentinelError> {
-    for path in event.paths {
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-
-        if matches!(
-            event.kind,
-            EventKind::Modify(notify::event::ModifyKind::Data(_))
-        ) && tailed_files.contains(&path)
-        {
-            if let Some(&pos) = positions.get(&path) {
-                let mut file = File::open(&path).await?;
-
-                file.seek(SeekFrom::Start(pos)).await?;
-
-                let mut new_content = String::new();
-                file.read_to_string(&mut new_content).await?;
-
-                let mut current_offset = pos;
-
-                for line in new_content.lines() {
-                    let line_bytes = line.len() as u64 + 1;
-                    let tail_line = TailLine {
-                        file_path: path.clone(),
-                        line: line.to_string(),
-                        byte_offset: current_offset,
-                    };
-
-                    if tx.send(Ok(tail_line)).await.is_err() {
-                        return Ok(());
-                    }
-
-                    current_offset += line_bytes;
-                }
-
-                positions.insert(path.clone(), current_offset);
-            }
-        } else if matches!(event.kind, EventKind::Create(_)) && !is_rotated_log(file_name) {
-            if let Some(cfg) = find_matching_config(&path, watch_configs, watched_dirs)
-                && matches_pattern(&path, &cfg.pattern)
-            {
-                tailed_files.insert(path.clone());
-                positions.insert(path.clone(), 0);
-
-                wait_for_file_stability(&path).await;
-
-                if let Err(e) = read_existing_lines(&path, positions, tx).await {
-                    warn!("failed to read newly created file {:?}: {}", path, e);
-                }
-            }
-        } else if matches!(event.kind, EventKind::Remove(_))
-            || (matches!(
-                event.kind,
-                EventKind::Modify(notify::event::ModifyKind::Name(_))
-            ) && is_rotated_log(file_name))
-        {
-            positions.remove(&path);
-            tailed_files.remove(&path);
-        }
-    }
-
-    Ok(())
-}
-
-fn find_matching_config<'a>(
-    path: &Path,
-    watch_configs: &'a [LogWatchConfig],
-    watched_dirs: &HashSet<PathBuf>,
-) -> Option<&'a LogWatchConfig> {
-    watch_configs
-        .iter()
-        .find(|cfg| watched_dirs.contains(&cfg.directory) && path.starts_with(&cfg.directory))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
     use tempfile::{NamedTempFile, TempDir};
 
     fn create_test_file(content: &str) -> NamedTempFile {
@@ -408,6 +255,27 @@ mod tests {
         writeln!(file, "{content}").unwrap();
         file.flush().unwrap();
         file
+    }
+
+    /// Receive up to `count` lines from the stream, bounded by `timeout`.
+    async fn collect_lines(
+        rx: &mut TokioReceiver<TailEvent>,
+        count: usize,
+        timeout: Duration,
+    ) -> Vec<TailLine> {
+        let mut lines = Vec::new();
+        let _ = tokio::time::timeout(timeout, async {
+            while let Some(event) = rx.recv().await {
+                if let Ok(line) = event {
+                    lines.push(line);
+                    if lines.len() >= count {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        lines
     }
 
     #[tokio::test]
@@ -425,6 +293,12 @@ mod tests {
 
         let tailer = FileTailer::new().with_files(vec![file1.clone(), file2.clone()]);
         assert_eq!(tailer.watched_files().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_tailer_with_watch_directory_invalid_pattern_fails() {
+        let result = FileTailer::new().with_watch_directory(PathBuf::from("/tmp"), "[invalid");
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -448,25 +322,13 @@ mod tests {
         let mut tailer = FileTailer::new().with_files(vec![path]);
         let mut rx = tailer.start().await.unwrap();
 
-        let mut lines = Vec::new();
-        tokio::select! {
-            () = async {
-                while let Some(event) = rx.recv().await {
-                    if let Ok(line) = event {
-                        lines.push(line.line);
-                    }
-                    if lines.len() >= 3 {
-                        break;
-                    }
-                }
-            } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
-        }
+        let lines = collect_lines(&mut rx, 3, Duration::from_secs(2)).await;
 
         tailer.stop();
-        assert!(lines.contains(&"line1".to_string()));
-        assert!(lines.contains(&"line2".to_string()));
-        assert!(lines.contains(&"line3".to_string()));
+        let got: Vec<&str> = lines.iter().map(|l| l.line.as_str()).collect();
+        assert!(got.contains(&"line1"));
+        assert!(got.contains(&"line2"));
+        assert!(got.contains(&"line3"));
     }
 
     #[tokio::test]
@@ -475,14 +337,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.log");
 
-        // Create file with initial content
         std::fs::write(&path, "initial\n").unwrap();
 
         let mut tailer = FileTailer::new().with_files(vec![path.clone()]);
         let mut rx = tailer.start().await.unwrap();
 
         // Wait for initial read
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Append new line with sync
         let mut f = std::fs::OpenOptions::new()
@@ -494,7 +355,7 @@ mod tests {
         drop(f);
 
         // Give notify time to deliver the event
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let mut new_lines = Vec::new();
         tokio::select! {
@@ -506,7 +367,7 @@ mod tests {
                         }
                 }
             } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {},
+            () = tokio::time::sleep(Duration::from_secs(5)) => {},
         }
 
         tailer.stop();
@@ -524,24 +385,11 @@ mod tests {
         let mut tailer = FileTailer::new().with_files(vec![path]);
         let mut rx = tailer.start().await.unwrap();
 
-        let mut offsets = Vec::new();
-        tokio::select! {
-            () = async {
-                while let Some(event) = rx.recv().await {
-                    if let Ok(line) = event {
-                        offsets.push(line.byte_offset);
-                    }
-                    if !offsets.is_empty() {
-                        break;
-                    }
-                }
-            } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
-        }
+        let lines = collect_lines(&mut rx, 1, Duration::from_secs(2)).await;
 
         tailer.stop();
-        assert!(!offsets.is_empty());
-        assert_eq!(offsets[0], 0);
+        assert!(!lines.is_empty());
+        assert_eq!(lines[0].byte_offset, 0);
     }
 
     #[tokio::test]
@@ -552,24 +400,11 @@ mod tests {
         let mut tailer = FileTailer::new().with_files(vec![path.clone()]);
         let mut rx = tailer.start().await.unwrap();
 
-        let mut file_paths = Vec::new();
-        tokio::select! {
-            () = async {
-                while let Some(event) = rx.recv().await {
-                    if let Ok(line) = event {
-                        file_paths.push(line.file_path.clone());
-                    }
-                    if !file_paths.is_empty() {
-                        break;
-                    }
-                }
-            } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
-        }
+        let lines = collect_lines(&mut rx, 1, Duration::from_secs(2)).await;
 
         tailer.stop();
-        assert!(!file_paths.is_empty());
-        assert_eq!(file_paths[0], path);
+        assert!(!lines.is_empty());
+        assert_eq!(lines[0].file_path, path);
     }
 
     #[tokio::test]
@@ -583,7 +418,7 @@ mod tests {
         assert!(tailer.is_running());
 
         tailer.stop();
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!tailer.is_running());
     }
 
@@ -599,24 +434,12 @@ mod tests {
         let mut tailer = FileTailer::new().with_files(vec![file1.clone(), file2.clone()]);
         let mut rx = tailer.start().await.unwrap();
 
-        let mut lines = Vec::new();
-        tokio::select! {
-            () = async {
-                while let Some(event) = rx.recv().await {
-                    if let Ok(line) = event {
-                        lines.push(line.line);
-                    }
-                    if lines.len() >= 2 {
-                        break;
-                    }
-                }
-            } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
-        }
+        let lines = collect_lines(&mut rx, 2, Duration::from_secs(2)).await;
 
         tailer.stop();
-        assert!(lines.contains(&"from file1".to_string()));
-        assert!(lines.contains(&"from file2".to_string()));
+        let got: Vec<&str> = lines.iter().map(|l| l.line.as_str()).collect();
+        assert!(got.contains(&"from file1"));
+        assert!(got.contains(&"from file2"));
     }
 
     #[tokio::test]
@@ -646,59 +469,6 @@ mod tests {
         assert_eq!(line.file_path, PathBuf::from("/var/log/test.log"));
     }
 
-    #[test]
-    fn test_is_rotated_log_detects_numeric_suffix() {
-        assert!(is_rotated_log("access.log.1"));
-        assert!(is_rotated_log("access.log.2"));
-        assert!(is_rotated_log("example.com-access.log.10"));
-        assert!(is_rotated_log("error.log.99"));
-    }
-
-    #[test]
-    fn test_is_rotated_log_ignores_normal_logs() {
-        assert!(!is_rotated_log("access.log"));
-        assert!(!is_rotated_log("error.log"));
-        assert!(!is_rotated_log("example.com-access.log"));
-        assert!(!is_rotated_log("auth.log"));
-    }
-
-    #[test]
-    fn test_is_rotated_log_ignores_gzipped() {
-        assert!(!is_rotated_log("access.log.1.gz"));
-        assert!(!is_rotated_log("error.log.2.gz"));
-    }
-
-    #[test]
-    fn test_matches_pattern_with_log_pattern() {
-        let pattern = Pattern::new("*.log").unwrap();
-        assert!(matches_pattern(Path::new("access.log"), &pattern));
-        assert!(matches_pattern(
-            Path::new("example.com-access.log"),
-            &pattern
-        ));
-        assert!(!matches_pattern(Path::new("access.log.1"), &pattern));
-        assert!(!matches_pattern(Path::new("access.log.gz"), &pattern));
-    }
-
-    #[test]
-    fn test_log_watch_config_new() {
-        let cfg = LogWatchConfig::new(PathBuf::from("/var/log/nginx"), "*.log");
-        assert_eq!(cfg.directory, PathBuf::from("/var/log/nginx"));
-    }
-
-    #[tokio::test]
-    async fn test_tailer_with_watch_directory() {
-        let temp_dir = TempDir::new().unwrap();
-        let log_dir = temp_dir.path().join("logs");
-        std::fs::create_dir(&log_dir).unwrap();
-
-        let existing_log = log_dir.join("app.log");
-        std::fs::write(&existing_log, "existing line\n").unwrap();
-
-        let tailer = FileTailer::new().with_watch_directory(log_dir, "*.log");
-        assert!(tailer.watched_files().is_empty());
-    }
-
     #[tokio::test]
     async fn test_tailer_discovers_existing_logs_in_directory() {
         let temp_dir = TempDir::new().unwrap();
@@ -709,28 +479,18 @@ mod tests {
         std::fs::write(log_dir.join("web.log"), "from web\n").unwrap();
         std::fs::write(log_dir.join("app.log.1"), "rotated\n").unwrap();
 
-        let mut tailer = FileTailer::new().with_watch_directory(log_dir, "*.log");
+        let mut tailer = FileTailer::new()
+            .with_watch_directory(log_dir, "*.log")
+            .unwrap();
         let mut rx = tailer.start().await.unwrap();
 
-        let mut lines = Vec::new();
-        tokio::select! {
-            () = async {
-                while let Some(event) = rx.recv().await {
-                    if let Ok(line) = event {
-                        lines.push(line.line);
-                    }
-                    if lines.len() >= 2 {
-                        break;
-                    }
-                }
-            } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
-        }
+        let lines = collect_lines(&mut rx, 2, Duration::from_secs(2)).await;
 
         tailer.stop();
-        assert!(lines.contains(&"from app".to_string()));
-        assert!(lines.contains(&"from web".to_string()));
-        assert!(!lines.contains(&"rotated".to_string()));
+        let got: Vec<&str> = lines.iter().map(|l| l.line.as_str()).collect();
+        assert!(got.contains(&"from app"));
+        assert!(got.contains(&"from web"));
+        assert!(!got.contains(&"rotated"));
     }
 
     #[tokio::test]
@@ -740,10 +500,12 @@ mod tests {
         let log_dir = temp_dir.path().join("logs");
         std::fs::create_dir(&log_dir).unwrap();
 
-        let mut tailer = FileTailer::new().with_watch_directory(log_dir.clone(), "*.log");
+        let mut tailer = FileTailer::new()
+            .with_watch_directory(log_dir.clone(), "*.log")
+            .unwrap();
         let mut rx = tailer.start().await.unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let new_log = log_dir.join("new-service.log");
         std::fs::write(&new_log, "new service line\n").unwrap();
@@ -757,7 +519,7 @@ mod tests {
                     }
                 }
             } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {},
+            () = tokio::time::sleep(Duration::from_secs(3)) => {},
         }
 
         tailer.stop();
@@ -778,15 +540,17 @@ mod tests {
         let log_path = log_dir.join("app.log");
         std::fs::write(&log_path, "before rotation\n").unwrap();
 
-        let mut tailer = FileTailer::new().with_watch_directory(log_dir.clone(), "*.log");
+        let mut tailer = FileTailer::new()
+            .with_watch_directory(log_dir.clone(), "*.log")
+            .unwrap();
         let mut rx = tailer.start().await.unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let rotated_path = log_dir.join("app.log.1");
         std::fs::rename(&log_path, &rotated_path).unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         std::fs::write(&log_path, "after rotation\n").unwrap();
 
@@ -799,7 +563,7 @@ mod tests {
                     }
                 }
             } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {},
+            () = tokio::time::sleep(Duration::from_secs(3)) => {},
         }
 
         tailer.stop();
@@ -817,14 +581,16 @@ mod tests {
         let log_dir = temp_dir.path().join("logs");
         std::fs::create_dir(&log_dir).unwrap();
 
-        let mut tailer = FileTailer::new().with_watch_directory(log_dir.clone(), "*.log");
+        let mut tailer = FileTailer::new()
+            .with_watch_directory(log_dir.clone(), "*.log")
+            .unwrap();
         let mut rx = tailer.start().await.unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         std::fs::write(log_dir.join("app.log.1"), "should not be tailed\n").unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         let mut lines = Vec::new();
         tokio::select! {
@@ -835,7 +601,7 @@ mod tests {
                     }
                 }
             } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
+            () = tokio::time::sleep(Duration::from_secs(2)) => {},
         }
 
         tailer.stop();
@@ -855,28 +621,15 @@ mod tests {
         std::fs::write(&specific_file, "auth line\n").unwrap();
         std::fs::write(log_dir.join("app.log"), "app line\n").unwrap();
 
-        let mut tailer = FileTailer::new()
-            .with_files(vec![specific_file])
-            .with_watch_directory(log_dir, "*.log");
+        let mut tailer = FileTailer::new().with_files(vec![specific_file]);
+        tailer = tailer.with_watch_directory(log_dir, "*.log").unwrap();
         let mut rx = tailer.start().await.unwrap();
 
-        let mut lines = Vec::new();
-        tokio::select! {
-            () = async {
-                while let Some(event) = rx.recv().await {
-                    if let Ok(line) = event {
-                        lines.push(line.line);
-                    }
-                    if lines.len() >= 2 {
-                        break;
-                    }
-                }
-            } => {},
-            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
-        }
+        let lines = collect_lines(&mut rx, 2, Duration::from_secs(2)).await;
 
         tailer.stop();
-        assert!(lines.contains(&"auth line".to_string()));
-        assert!(lines.contains(&"app line".to_string()));
+        let got: Vec<&str> = lines.iter().map(|l| l.line.as_str()).collect();
+        assert!(got.contains(&"auth line"));
+        assert!(got.contains(&"app line"));
     }
 }

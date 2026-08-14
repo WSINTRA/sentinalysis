@@ -60,14 +60,31 @@ impl LogSink for RepositorySink<'_> {
 pub struct Scanner {
     pipeline: Arc<Pipeline>,
     cancel_token: CancellationToken,
+    batch_size: usize,
+    batch_interval: Option<Duration>,
 }
 
 impl Scanner {
+    /// Scanner with the default batching policy.
     #[must_use]
     pub fn new(pipeline: Arc<Pipeline>) -> Self {
+        Self::with_batching(pipeline, BATCH_SIZE, Some(BATCH_INTERVAL))
+    }
+
+    /// Scanner with an explicit batching policy. `batch_interval: None`
+    /// disables timer-based flushing (size and shutdown flushes only) —
+    /// used by tests for deterministic behaviour.
+    #[must_use]
+    pub fn with_batching(
+        pipeline: Arc<Pipeline>,
+        batch_size: usize,
+        batch_interval: Option<Duration>,
+    ) -> Self {
         Self {
             pipeline,
             cancel_token: CancellationToken::new(),
+            batch_size,
+            batch_interval,
         }
     }
 
@@ -89,39 +106,50 @@ impl Scanner {
         mut rx: Receiver<TailEvent>,
         sink: &S,
     ) -> Result<(), SentinelError> {
-        let mut batch: Vec<InsertLogEntry> = Vec::with_capacity(BATCH_SIZE);
-        let mut flush_interval = tokio::time::interval(BATCH_INTERVAL);
+        let mut batch: Vec<InsertLogEntry> = Vec::with_capacity(self.batch_size);
+        let mut flush_interval = self.batch_interval.map(tokio::time::interval);
 
         info!("scanner started");
 
         loop {
-            tokio::select! {
-                () = self.cancel_token.cancelled() => {
-                    // Final flush so no processed entries are lost.
-                    self.flush_batch(sink, &mut batch).await?;
-                    info!("scanner stopped");
-                    break;
-                }
-                _ = flush_interval.tick() => {
+            let event = tokio::select! {
+                // In-flight events win over cancellation so that lines
+                // already in the channel are still processed at shutdown.
+                biased;
+                Some(event) = rx.recv() => Some(event),
+                () = self.cancel_token.cancelled() => None,
+                _ = async {
+                    match &mut flush_interval {
+                        Some(interval) => interval.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     if !batch.is_empty() {
                         self.flush_batch(sink, &mut batch).await?;
                     }
+                    continue;
                 }
-                Some(event) = rx.recv() => {
-                    match event {
-                        Ok(line) => match self.pipeline.process_line(&line).await {
-                            Ok(Some(entry)) => batch.push(entry),
-                            // Empty/declined lines are expected, not errors.
-                            Ok(None) => {}
-                            Err(e) => warn!("failed to process line: {e}"),
-                        },
-                        Err(e) => error!("tailer error: {e}"),
-                    }
+            };
 
-                    if batch.len() >= BATCH_SIZE {
-                        self.flush_batch(sink, &mut batch).await?;
-                    }
-                }
+            let Some(event) = event else {
+                // Cancelled: final flush so no processed entries are lost.
+                self.flush_batch(sink, &mut batch).await?;
+                info!("scanner stopped");
+                break;
+            };
+
+            match event {
+                Ok(line) => match self.pipeline.process_line(&line).await {
+                    Ok(Some(entry)) => batch.push(entry),
+                    // Empty/declined lines are expected, not errors.
+                    Ok(None) => {}
+                    Err(e) => warn!("failed to process line: {e}"),
+                },
+                Err(e) => error!("tailer error: {e}"),
+            }
+
+            if batch.len() >= self.batch_size {
+                self.flush_batch(sink, &mut batch).await?;
             }
         }
 
@@ -162,7 +190,7 @@ mod tests {
     use crate::log_scanner::classifier::Classifier;
     use crate::log_scanner::filter::NoiseFilter;
     use crate::log_scanner::pipeline::{InMemoryServiceResolver, ParserRegistry};
-    use crate::log_scanner::tailer::{TailEvent, TailLine};
+    use crate::log_scanner::tailer::TailLine;
     use std::path::PathBuf;
     use std::sync::Mutex;
 
@@ -225,7 +253,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_scanner_flushes_at_batch_size_and_on_shutdown() {
-        let scanner = Scanner::new(test_pipeline());
+        // No timer: only size- and shutdown-based flushes can happen.
+        let scanner = Scanner::with_batching(test_pipeline(), BATCH_SIZE, None);
         let cancel = scanner.cancel_token();
         let sink = Arc::new(FakeSink::default());
         let (tx, rx) = tokio::sync::mpsc::channel(2 * BATCH_SIZE);
