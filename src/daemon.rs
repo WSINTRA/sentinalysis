@@ -1,7 +1,15 @@
 use sentinel::config::Config;
+use sentinel::db::repositories::log_entry_repo::LogEntryRepository;
+use sentinel::db::repositories::service_repo::ServiceRepository;
 use sentinel::error::SentinelError;
+use sentinel::log_scanner::classifier::Classifier;
+use sentinel::log_scanner::filter::NoiseFilter;
+use sentinel::log_scanner::pipeline::{DbServiceResolver, ParserRegistry, Pipeline};
+use sentinel::log_scanner::scanner::{RepositorySink, Scanner};
+use sentinel::log_scanner::tailer::FileTailer;
 use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 const PID_FILE: &str = "/run/sentinel.pid";
@@ -50,8 +58,15 @@ async fn daemon_loop(
 ) -> Result<(), SentinelError> {
     info!("Daemon loop starting");
 
-    let scanner = sentinel::log_scanner::scanner::Scanner::new(pool);
-    let mut tailer = sentinel::log_scanner::tailer::FileTailer::new();
+    let log_repo = LogEntryRepository::new(pool.clone());
+    let pipeline = Arc::new(Pipeline::new(
+        ParserRegistry::default_registry(),
+        Arc::new(NoiseFilter::new()),
+        Arc::new(Classifier::new()),
+        Arc::new(DbServiceResolver::new(ServiceRepository::new(pool))),
+    ));
+
+    let mut tailer = FileTailer::new();
 
     for dir_config in &config.log_watching.directories {
         tailer = tailer.with_watch_directory(dir_config.path.clone(), &dir_config.pattern);
@@ -64,7 +79,9 @@ async fn daemon_loop(
     let rx = tailer.start().await?;
     info!("File tailer started, watching logs");
 
-    scanner.run(rx).await?;
+    Scanner::new(pipeline)
+        .run(rx, &RepositorySink::new(&log_repo))
+        .await?;
 
     Ok(())
 }

@@ -4,6 +4,7 @@ use uuid::Uuid;
 use crate::db::models::{InsertService, Service};
 use crate::error::SentinelError;
 
+#[derive(Clone)]
 pub struct ServiceRepository {
     pool: PgPool,
 }

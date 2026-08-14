@@ -1,60 +1,94 @@
-use std::path::Path;
+//! Batching orchestrator for the log pipeline.
+//!
+//! `Scanner` consumes `TailEvent`s from the tailer, runs each line through
+//! the [`Pipeline`], and flushes batches of `InsertLogEntry` to a
+//! [`LogSink`] (the database in production, an in-memory collector in
+//! tests). Batching policy: flush at `BATCH_SIZE` entries or every
+//! `BATCH_INTERVAL`, whichever comes first; a final flush happens on
+//! shutdown.
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::db::models::InsertLogEntry;
 use crate::db::repositories::log_entry_repo::LogEntryRepository;
-use crate::db::repositories::service_repo::ServiceRepository;
 use crate::error::SentinelError;
-use crate::log_scanner::classifier::{Classifier, ThreatLevel, ThreatResult};
-use crate::log_scanner::filter::{FilterResult, NoiseFilter};
-use crate::log_scanner::parser::LogParser;
-use crate::log_scanner::parser::auth::AuthLogParser;
-use crate::log_scanner::parser::nginx::NginxAccessParser;
-use crate::log_scanner::tailer::{TailEvent, TailLine};
+use crate::log_scanner::pipeline::{BoxFuture, Pipeline};
+use crate::log_scanner::tailer::TailEvent;
 
+/// Flush a batch after this many entries.
 const BATCH_SIZE: usize = 100;
+/// ...or on this timer, whichever comes first.
 const BATCH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Persists a batch of log entries.
+pub trait LogSink: Send + Sync {
+    /// Insert the entries, returning how many were written.
+    fn insert_batch<'s>(
+        &'s self,
+        entries: &'s [InsertLogEntry],
+    ) -> BoxFuture<'s, Result<usize, SentinelError>>;
+}
+
+/// [`LogSink`] backed by the [`LogEntryRepository`].
+pub struct RepositorySink<'a> {
+    repo: &'a LogEntryRepository,
+}
+
+impl<'a> RepositorySink<'a> {
+    #[must_use]
+    pub fn new(repo: &'a LogEntryRepository) -> Self {
+        Self { repo }
+    }
+}
+
+impl LogSink for RepositorySink<'_> {
+    fn insert_batch<'s>(
+        &'s self,
+        entries: &'s [InsertLogEntry],
+    ) -> BoxFuture<'s, Result<usize, SentinelError>> {
+        Box::pin(self.repo.insert_batch(entries))
+    }
+}
+
+/// Consumes tail events, processes them with the pipeline, and batches
+/// writes to the sink.
 pub struct Scanner {
-    pool: PgPool,
+    pipeline: Arc<Pipeline>,
     cancel_token: CancellationToken,
 }
 
 impl Scanner {
     #[must_use]
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pipeline: Arc<Pipeline>) -> Self {
         Self {
-            pool,
+            pipeline,
             cancel_token: CancellationToken::new(),
         }
     }
 
-    fn select_parser(file_path: &Path) -> Box<dyn LogParser> {
-        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-        if file_name == "auth.log" {
-            Box::new(AuthLogParser::new())
-        } else {
-            Box::new(NginxAccessParser::new())
-        }
-    }
-
+    /// Request a stop; the current batch is flushed before `run` returns.
     pub fn stop(&self) {
         self.cancel_token.cancel();
     }
 
-    pub async fn run(self, mut rx: Receiver<TailEvent>) -> Result<(), SentinelError> {
-        let log_repo = LogEntryRepository::new(self.pool.clone());
-        let service_repo = ServiceRepository::new(self.pool.clone());
-        let filter = Arc::new(NoiseFilter::new());
-        let classifier = Arc::new(Classifier::new());
+    /// A clone of the cancel token, for callers that need to stop the
+    /// scanner without keeping a `&Scanner` alive.
+    #[must_use]
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
 
+    /// Run until the cancel token fires or the event stream ends.
+    pub async fn run<S: LogSink>(
+        self,
+        mut rx: Receiver<TailEvent>,
+        sink: &S,
+    ) -> Result<(), SentinelError> {
         let mut batch: Vec<InsertLogEntry> = Vec::with_capacity(BATCH_SIZE);
         let mut flush_interval = tokio::time::interval(BATCH_INTERVAL);
 
@@ -63,39 +97,29 @@ impl Scanner {
         loop {
             tokio::select! {
                 () = self.cancel_token.cancelled() => {
-                    if !batch.is_empty() {
-                        self.flush_batch(&log_repo, &mut batch).await?;
-                    }
+                    // Final flush so no processed entries are lost.
+                    self.flush_batch(sink, &mut batch).await?;
                     info!("scanner stopped");
                     break;
                 }
                 _ = flush_interval.tick() => {
                     if !batch.is_empty() {
-                        self.flush_batch(&log_repo, &mut batch).await?;
+                        self.flush_batch(sink, &mut batch).await?;
                     }
                 }
                 Some(event) = rx.recv() => {
                     match event {
-                        Ok(line) => {
-                            let parser = Self::select_parser(&line.file_path);
-                            if let Err(e) = self.process_line(
-                                &line,
-                                &*parser,
-                                &filter,
-                                &classifier,
-                                &service_repo,
-                                &mut batch,
-                            ).await {
-                                warn!("failed to process line: {}", e);
-                            }
+                        Ok(line) => match self.pipeline.process_line(&line).await {
+                            Ok(Some(entry)) => batch.push(entry),
+                            // Empty/declined lines are expected, not errors.
+                            Ok(None) => {}
+                            Err(e) => warn!("failed to process line: {e}"),
+                        },
+                        Err(e) => error!("tailer error: {e}"),
+                    }
 
-                            if batch.len() >= BATCH_SIZE {
-                                self.flush_batch(&log_repo, &mut batch).await?;
-                            }
-                        }
-                        Err(e) => {
-                            error!("tailer error: {}", e);
-                        }
+                    if batch.len() >= BATCH_SIZE {
+                        self.flush_batch(sink, &mut batch).await?;
                     }
                 }
             }
@@ -104,126 +128,11 @@ impl Scanner {
         Ok(())
     }
 
-    fn extract_vhost_from_file_path(file_path: &Path) -> Option<String> {
-        file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|name| name.ends_with("-access.log"))
-            .map(|name| name.trim_end_matches("-access.log").to_string())
-    }
-
-    #[allow(clippy::cast_possible_wrap)]
-    async fn process_line(
+    /// Write the pending batch. On failure the entries are put back so
+    /// they are retried on the next flush.
+    async fn flush_batch<S: LogSink>(
         &self,
-        line: &TailLine,
-        parser: &dyn LogParser,
-        filter: &Arc<NoiseFilter>,
-        classifier: &Arc<Classifier>,
-        service_repo: &ServiceRepository,
-        batch: &mut Vec<InsertLogEntry>,
-    ) -> Result<(), SentinelError> {
-        let parsed = parser.parse(&line.line).map_err(|e| {
-            SentinelError::ParseError(format!(
-                "{} [{}]: {}",
-                parser.name(),
-                line.file_path.display(),
-                e
-            ))
-        })?;
-
-        let Some(entry) = parsed else {
-            return Ok(());
-        };
-
-        let filter_result = filter.evaluate(&entry);
-        let threat_result = classifier.classify(&entry);
-
-        let is_noise = matches!(filter_result, FilterResult::Exclude(_));
-        let noise_reason = match &filter_result {
-            FilterResult::Exclude(reason) => Some(reason.clone()),
-            _ => None,
-        };
-
-        let virtual_host = Self::extract_vhost_from_file_path(&line.file_path)
-            .or_else(|| entry.metadata.virtual_host.clone());
-
-        let service_id = if let Some(vhost) = &virtual_host {
-            let service = crate::db::models::InsertService {
-                name: vhost.clone(),
-                unit_type: "nginx-vhost".to_string(),
-                log_paths: None,
-                virtual_host: Some(vhost.clone()),
-            };
-            match service_repo.get_or_create(&service).await {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    warn!("failed to get/create service '{}': {}", vhost, e);
-                    None
-                }
-            }
-        } else {
-            let file_name = line
-                .file_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown-log")
-                .to_string();
-            let service = crate::db::models::InsertService {
-                name: file_name.clone(),
-                unit_type: "system-log".to_string(),
-                log_paths: None,
-                virtual_host: None,
-            };
-            match service_repo.get_or_create(&service).await {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    warn!("failed to get/create service '{}': {}", file_name, e);
-                    None
-                }
-            }
-        };
-
-        let level = Self::classify_level(entry.level, &threat_result);
-
-        let db_entry = InsertLogEntry {
-            service_id,
-            timestamp: entry.timestamp,
-            level,
-            message: entry.message,
-            raw_line: if is_noise { None } else { Some(entry.raw) },
-            client_ip: entry.metadata.client_ip.map(|ip| ip.to_string()),
-            request_path: entry.metadata.request_path,
-            status_code: entry.metadata.status_code.map(|s| s as i16),
-            response_time_ms: entry.metadata.response_time_ms.map(|ms| ms as i64),
-            is_noise,
-            noise_reason,
-        };
-
-        batch.push(db_entry);
-        Ok(())
-    }
-
-    fn classify_level(
-        base_level: crate::log_scanner::parser::LogLevel,
-        threat: &ThreatResult,
-    ) -> String {
-        if threat.threat_level >= ThreatLevel::High {
-            return "security".to_string();
-        }
-
-        match base_level {
-            crate::log_scanner::parser::LogLevel::Debug => "debug".to_string(),
-            crate::log_scanner::parser::LogLevel::Info => "info".to_string(),
-            crate::log_scanner::parser::LogLevel::Warn => "warn".to_string(),
-            crate::log_scanner::parser::LogLevel::Error => "error".to_string(),
-            crate::log_scanner::parser::LogLevel::Critical => "critical".to_string(),
-            crate::log_scanner::parser::LogLevel::Security => "security".to_string(),
-        }
-    }
-
-    async fn flush_batch(
-        &self,
-        log_repo: &LogEntryRepository,
+        sink: &S,
         batch: &mut Vec<InsertLogEntry>,
     ) -> Result<(), SentinelError> {
         if batch.is_empty() {
@@ -233,12 +142,12 @@ impl Scanner {
         let count = batch.len();
         let entries = std::mem::take(batch);
 
-        match log_repo.insert_batch(&entries).await {
+        match sink.insert_batch(&entries).await {
             Ok(inserted) => {
-                info!("flushed {} log entries ({} inserted)", count, inserted);
+                info!("flushed {count} log entries ({inserted} inserted)");
             }
             Err(e) => {
-                error!("failed to flush batch: {}", e);
+                error!("failed to flush batch: {e}");
                 *batch = entries;
             }
         }
@@ -250,64 +159,116 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_scanner::parser::LogLevel;
+    use crate::log_scanner::classifier::Classifier;
+    use crate::log_scanner::filter::NoiseFilter;
+    use crate::log_scanner::pipeline::{InMemoryServiceResolver, ParserRegistry};
+    use crate::log_scanner::tailer::{TailEvent, TailLine};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
 
-    #[tokio::test]
-    async fn test_scanner_creation() {
-        let pool = PgPool::connect_lazy("postgresql://test:test@localhost/test").unwrap();
-        let scanner = Scanner::new(pool);
-        let _ = &scanner;
+    /// Collects flushed batches in memory.
+    #[derive(Default)]
+    struct FakeSink {
+        batches: Arc<Mutex<Vec<Vec<InsertLogEntry>>>>,
+    }
+
+    impl LogSink for FakeSink {
+        fn insert_batch<'s>(
+            &'s self,
+            entries: &'s [InsertLogEntry],
+        ) -> BoxFuture<'s, Result<usize, SentinelError>> {
+            let snapshot = entries.to_vec();
+            let batches = self.batches.clone();
+            Box::pin(async move {
+                let len = snapshot.len();
+                batches.lock().unwrap().push(snapshot);
+                Ok(len)
+            })
+        }
+    }
+
+    fn test_pipeline() -> Arc<Pipeline> {
+        Arc::new(Pipeline::new(
+            ParserRegistry::default_registry(),
+            Arc::new(NoiseFilter::new()),
+            Arc::new(Classifier::new()),
+            Arc::new(InMemoryServiceResolver::new()),
+        ))
+    }
+
+    fn nginx_line(i: u64) -> TailLine {
+        TailLine {
+            file_path: PathBuf::from("/var/log/nginx/app.example.com-access.log"),
+            line: format!(
+                "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /{i} HTTP/1.1\" 200 15 \"-\" \"curl/8.0\" \"app.example.com\" 0.1"
+            ),
+            byte_offset: i,
+        }
+    }
+
+    async fn wait_for_batches(sink: &FakeSink, n: usize) -> bool {
+        for _ in 0..250 {
+            if sink.batches.lock().unwrap().len() >= n {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
     }
 
     #[tokio::test]
-    async fn test_scanner_stop() {
-        let pool = PgPool::connect_lazy("postgresql://test:test@localhost/test").unwrap();
-        let scanner = Scanner::new(pool);
+    async fn test_scanner_stop_cancels() {
+        let scanner = Scanner::new(test_pipeline());
         scanner.stop();
         assert!(scanner.cancel_token.is_cancelled());
     }
 
-    #[test]
-    fn test_classify_level_security_threat() {
-        let threat = crate::log_scanner::classifier::ThreatResult {
-            threat_level: ThreatLevel::High,
-            categories: vec![],
-            confidence: 0.9,
-        };
-        let level = Scanner::classify_level(LogLevel::Info, &threat);
-        assert_eq!(level, "security");
-    }
+    #[tokio::test]
+    async fn test_scanner_flushes_at_batch_size_and_on_shutdown() {
+        let scanner = Scanner::new(test_pipeline());
+        let cancel = scanner.cancel_token();
+        let sink = Arc::new(FakeSink::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(2 * BATCH_SIZE);
 
-    #[test]
-    fn test_classify_level_base_info() {
-        let threat = crate::log_scanner::classifier::ThreatResult {
-            threat_level: ThreatLevel::None,
-            categories: vec![],
-            confidence: 0.0,
-        };
-        let level = Scanner::classify_level(LogLevel::Info, &threat);
-        assert_eq!(level, "info");
-    }
+        let sink2 = sink.clone();
+        let handle = tokio::spawn(async move { scanner.run(rx, sink2.as_ref()).await });
 
-    #[test]
-    fn test_classify_level_base_error() {
-        let threat = crate::log_scanner::classifier::ThreatResult {
-            threat_level: ThreatLevel::None,
-            categories: vec![],
-            confidence: 0.0,
-        };
-        let level = Scanner::classify_level(LogLevel::Error, &threat);
-        assert_eq!(level, "error");
+        // BATCH_SIZE lines trigger a size-based flush.
+        for i in 0..BATCH_SIZE as u64 {
+            tx.send(Ok::<TailLine, SentinelError>(nginx_line(i)))
+                .await
+                .unwrap();
+        }
+        assert!(
+            wait_for_batches(&sink, 1).await,
+            "expected a size-based flush"
+        );
+        assert_eq!(sink.batches.lock().unwrap()[0].len(), BATCH_SIZE);
+
+        // One more line, then shutdown: it is flushed by the final flush.
+        tx.send(Ok(nginx_line(BATCH_SIZE as u64))).await.unwrap();
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+
+        let batches = sink.batches.lock().unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1].len(), 1);
     }
 
     #[tokio::test]
-    async fn test_flush_batch_empty() {
-        let pool = PgPool::connect_lazy("postgresql://test:test@localhost/test").unwrap();
-        let scanner = Scanner::new(pool.clone());
-        let log_repo = LogEntryRepository::new(pool);
-        let mut batch: Vec<InsertLogEntry> = vec![];
+    async fn test_scanner_empty_batch_does_not_flush() {
+        let scanner = Scanner::new(test_pipeline());
+        let cancel = scanner.cancel_token();
+        let sink = Arc::new(FakeSink::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
 
-        let result = scanner.flush_batch(&log_repo, &mut batch).await;
-        assert!(result.is_ok());
+        let sink2 = sink.clone();
+        let handle = tokio::spawn(async move { scanner.run(rx, sink2.as_ref()).await });
+        drop(tx);
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+
+        // Cancelling with an empty batch must not produce a write.
+        assert!(sink.batches.lock().unwrap().is_empty());
     }
 }
