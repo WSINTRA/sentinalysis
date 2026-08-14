@@ -64,10 +64,11 @@ impl LogViewer {
     async fn load_virtual_hosts(&mut self) -> Result<(), SentinelError> {
         let db_hosts: Vec<(String, i64)> = sqlx::query_as(
             r"
-            SELECT virtual_host, COUNT(*) as cnt
-            FROM log_entries
-            WHERE virtual_host IS NOT NULL
-            GROUP BY virtual_host
+            SELECT s.virtual_host, COUNT(*) as cnt
+            FROM log_entries le
+            JOIN services s ON le.service_id = s.id
+            WHERE s.virtual_host IS NOT NULL
+            GROUP BY s.virtual_host
             ORDER BY cnt DESC
             ",
         )
@@ -101,10 +102,11 @@ impl LogViewer {
     async fn load_recent_entries(&mut self, host: &str) -> Result<(), SentinelError> {
         let db_entries: Vec<DbLogEntry> = sqlx::query_as(
             r"
-            SELECT id, timestamp, level, message, raw_line, virtual_host
-            FROM log_entries
-            WHERE virtual_host = $1
-            ORDER BY id DESC
+            SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.virtual_host
+            FROM log_entries le
+            JOIN services s ON le.service_id = s.id
+            WHERE s.virtual_host = $1
+            ORDER BY le.id DESC
             LIMIT $2
             ",
         )
