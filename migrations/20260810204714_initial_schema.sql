@@ -19,7 +19,7 @@ CREATE TABLE log_entries (
     level TEXT NOT NULL,
     message TEXT NOT NULL,
     raw_line TEXT,
-    client_ip INET,
+    client_ip TEXT,
     request_path TEXT,
     status_code SMALLINT,
     response_time_ms BIGINT,
