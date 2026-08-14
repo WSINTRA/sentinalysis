@@ -8,17 +8,13 @@ pub async fn create_pool() -> Result<PgPool, SentinelError> {
         SentinelError::ConfigError("DATABASE_URL environment variable not set".into())
     })?;
 
-    PgPool::connect(&database_url)
-        .await
-        .map_err(|e| SentinelError::DatabaseError(e.to_string()))
+    let pool = PgPool::connect(&database_url).await?;
+    Ok(pool)
 }
 
 pub async fn health_check(pool: &PgPool) -> Result<(), SentinelError> {
-    sqlx::query("SELECT 1")
-        .fetch_one(pool)
-        .await
-        .map(|_| ())
-        .map_err(|e| SentinelError::DatabaseError(e.to_string()))
+    sqlx::query("SELECT 1").fetch_one(pool).await?;
+    Ok(())
 }
 
 #[cfg(test)]

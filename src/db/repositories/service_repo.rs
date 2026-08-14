@@ -23,42 +23,32 @@ impl ServiceRepository {
         .bind(service.log_paths.as_deref())
         .bind(service.virtual_host.as_deref())
         .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("duplicate key") {
-                SentinelError::DatabaseError(format!(
-                    "service '{}' already exists",
-                    service.name
-                ))
-            } else {
-                SentinelError::DatabaseError(e.to_string())
-            }
-        })?;
+        .await?;
 
         Ok(result.get::<Uuid, _>("id"))
     }
 
     pub async fn find_by_name(&self, name: &str) -> Result<Option<Service>, SentinelError> {
-        sqlx::query_as::<_, Service>(
+        let service = sqlx::query_as::<_, Service>(
             r"SELECT id, name, unit_type, log_paths, virtual_host, created_at FROM services WHERE name = $1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| SentinelError::DatabaseError(e.to_string()))
+        .await?;
+        Ok(service)
     }
 
     pub async fn find_by_virtual_host(
         &self,
         vhost: &str,
     ) -> Result<Option<Service>, SentinelError> {
-        sqlx::query_as::<_, Service>(
+        let service = sqlx::query_as::<_, Service>(
             r"SELECT id, name, unit_type, log_paths, virtual_host, created_at FROM services WHERE virtual_host = $1",
         )
         .bind(vhost)
         .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| SentinelError::DatabaseError(e.to_string()))
+        .await?;
+        Ok(service)
     }
 
     pub async fn get_or_create(&self, service: &InsertService) -> Result<Uuid, SentinelError> {
@@ -69,20 +59,19 @@ impl ServiceRepository {
     }
 
     pub async fn list_all(&self) -> Result<Vec<Service>, SentinelError> {
-        sqlx::query_as::<_, Service>(
+        let services = sqlx::query_as::<_, Service>(
             r"SELECT id, name, unit_type, log_paths, virtual_host, created_at FROM services ORDER BY name",
         )
         .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SentinelError::DatabaseError(e.to_string()))
+        .await?;
+        Ok(services)
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<bool, SentinelError> {
         let result = sqlx::query("DELETE FROM services WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
-            .await
-            .map_err(|e| SentinelError::DatabaseError(e.to_string()))?;
+            .await?;
 
         Ok(result.rows_affected() > 0)
     }

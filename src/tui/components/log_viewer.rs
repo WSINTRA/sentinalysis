@@ -140,8 +140,7 @@ impl LogViewer {
         )
         .bind(hosts)
         .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SentinelError::DatabaseError(e.to_string()))?;
+        .await?;
 
         let counts: HashMap<String, i64> = db_counts.into_iter().collect();
 
@@ -199,8 +198,7 @@ impl LogViewer {
         )
         .bind(names)
         .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SentinelError::DatabaseError(e.to_string()))?;
+        .await?;
 
         let counts: HashMap<String, i64> = db_counts.into_iter().collect();
 
@@ -232,8 +230,7 @@ impl LogViewer {
             .bind(name)
             .bind(MAX_ENTRIES_PER_HOST.try_into().unwrap_or(i64::MAX))
             .fetch_all(&self.pool)
-            .await
-            .map_err(|e| SentinelError::DatabaseError(e.to_string()))?
+            .await?
         } else {
             sqlx::query_as(
                 r"
@@ -248,8 +245,7 @@ impl LogViewer {
             .bind(name)
             .bind(MAX_ENTRIES_PER_HOST.try_into().unwrap_or(i64::MAX))
             .fetch_all(&self.pool)
-            .await
-            .map_err(|e| SentinelError::DatabaseError(e.to_string()))?
+            .await?
         };
 
         let entries: Vec<DisplayLogEntry> =
@@ -500,8 +496,7 @@ impl LogViewer {
             .bind(name)
             .bind(oldest_id)
             .fetch_all(&self.pool)
-            .await
-            .map_err(|e| SentinelError::DatabaseError(e.to_string()))?;
+            .await?;
 
         if new_db_entries.is_empty() {
             return Ok(());

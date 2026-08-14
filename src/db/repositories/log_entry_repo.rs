@@ -37,8 +37,7 @@ impl LogEntryRepository {
             .bind(entry.is_noise)
             .bind(entry.noise_reason.as_deref())
             .execute(&self.pool)
-            .await
-            .map_err(|e| SentinelError::DatabaseError(e.to_string()))?;
+            .await?;
 
             total_inserted += result.rows_affected() as usize;
         }

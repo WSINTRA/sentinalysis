@@ -128,8 +128,7 @@ impl FileTailer {
             .with_compare_contents(true);
 
         let handler = ChannelHandler { sender: notify_tx };
-        let mut watcher = RecommendedWatcher::new(handler, config)
-            .map_err(|e| SentinelError::FileTailingError(e.to_string()))?;
+        let mut watcher = RecommendedWatcher::new(handler, config)?;
 
         let files = self.files.clone();
         let watch_configs = self.watch_configs.clone();
@@ -137,17 +136,13 @@ impl FileTailer {
 
         for file in &files {
             if file.exists() {
-                watcher
-                    .watch(file, RecursiveMode::NonRecursive)
-                    .map_err(|e| SentinelError::FileTailingError(e.to_string()))?;
+                watcher.watch(file, RecursiveMode::NonRecursive)?;
             }
         }
 
         for cfg in &watch_configs {
             if cfg.directory.is_dir() {
-                watcher
-                    .watch(&cfg.directory, RecursiveMode::NonRecursive)
-                    .map_err(|e| SentinelError::FileTailingError(e.to_string()))?;
+                watcher.watch(&cfg.directory, RecursiveMode::NonRecursive)?;
             }
         }
 
@@ -245,9 +240,7 @@ async fn read_existing_lines(
     positions: &mut std::collections::HashMap<PathBuf, u64>,
     tx: &TokioSender<TailEvent>,
 ) -> Result<(), SentinelError> {
-    let content = tokio::fs::read_to_string(file)
-        .await
-        .map_err(|e| SentinelError::Io(e.to_string()))?;
+    let content = tokio::fs::read_to_string(file).await?;
     let mut offset: u64 = 0;
 
     for line in content.lines() {
@@ -275,9 +268,7 @@ async fn discover_existing_logs(
     tailed_files: &mut HashSet<PathBuf>,
     tx: &TokioSender<TailEvent>,
 ) -> Result<(), SentinelError> {
-    let mut entries = tokio::fs::read_dir(&cfg.directory)
-        .await
-        .map_err(|e| SentinelError::Io(e.to_string()))?;
+    let mut entries = tokio::fs::read_dir(&cfg.directory).await?;
 
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
@@ -343,18 +334,12 @@ async fn handle_event(
         ) && tailed_files.contains(&path)
         {
             if let Some(&pos) = positions.get(&path) {
-                let mut file = File::open(&path)
-                    .await
-                    .map_err(|e| SentinelError::Io(e.to_string()))?;
+                let mut file = File::open(&path).await?;
 
-                file.seek(SeekFrom::Start(pos))
-                    .await
-                    .map_err(|e| SentinelError::Io(e.to_string()))?;
+                file.seek(SeekFrom::Start(pos)).await?;
 
                 let mut new_content = String::new();
-                file.read_to_string(&mut new_content)
-                    .await
-                    .map_err(|e| SentinelError::Io(e.to_string()))?;
+                file.read_to_string(&mut new_content).await?;
 
                 let mut current_offset = pos;
 
