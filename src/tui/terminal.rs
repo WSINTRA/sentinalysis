@@ -144,18 +144,20 @@ impl Tui {
     fn key_to_action(key: &crossterm::event::KeyEvent) -> Action {
         match key.code {
             crossterm::event::KeyCode::Char('q') => Action::Quit,
+            crossterm::event::KeyCode::Char('/') => Action::ToggleFilter,
             crossterm::event::KeyCode::Up => Action::SelectUp,
             crossterm::event::KeyCode::Down => Action::SelectDown,
             crossterm::event::KeyCode::Tab => Action::ToggleFocus,
             crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('r') => {
                 Action::Refresh
             }
-            crossterm::event::KeyCode::Char('/') => Action::ToggleFilter,
             crossterm::event::KeyCode::Esc => Action::ClearFilter,
+            crossterm::event::KeyCode::Backspace => Action::FilterBackspace,
             crossterm::event::KeyCode::PageUp => Action::PageUp,
             crossterm::event::KeyCode::PageDown => Action::PageDown,
             crossterm::event::KeyCode::Home => Action::ScrollToTop,
             crossterm::event::KeyCode::End => Action::ScrollToBottom,
+            crossterm::event::KeyCode::Char(c) => Action::FilterInput(c),
             _ => Action::Tick,
         }
     }

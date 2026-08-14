@@ -301,7 +301,7 @@ impl LogViewer {
         let items: Vec<ListItem> = filtered.iter().map(|e| Self::entry_to_list_item(e)).collect();
 
         let filter_indicator = if self.filter_mode {
-            " [FILTER MODE]"
+            &format!(" [filter: '{}']", self.filter_text)[..]
         } else if !self.filter_text.is_empty() {
             &format!(" (filter: '{}')", self.filter_text)[..]
         } else {
@@ -355,6 +355,18 @@ impl Component for LogViewer {
                     Ok(None)
                 }
                 Action::Quit => Ok(Some(Action::Quit)),
+                Action::Refresh => {
+                    self.filter_mode = false;
+                    Ok(None)
+                }
+                Action::FilterInput(c) => {
+                    self.filter_text.push(*c);
+                    Ok(None)
+                }
+                Action::FilterBackspace => {
+                    self.filter_text.pop();
+                    Ok(None)
+                }
                 _ => Ok(None),
             };
         }

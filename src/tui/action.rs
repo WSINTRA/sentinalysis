@@ -45,7 +45,10 @@ pub enum Action {
     ScrollToBottom,
 
     #[strum(to_string = "FilterInput")]
-    FilterInput,
+    FilterInput(char),
+
+    #[strum(to_string = "FilterBackspace")]
+    FilterBackspace,
 
     #[strum(to_string = "LoadOlderEntries")]
     LoadOlderEntries,
