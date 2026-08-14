@@ -14,6 +14,7 @@ use crate::error::SentinelError;
 use crate::log_scanner::classifier::{Classifier, ThreatLevel, ThreatResult};
 use crate::log_scanner::filter::{FilterResult, NoiseFilter};
 use crate::log_scanner::parser::LogParser;
+use crate::log_scanner::parser::auth::AuthLogParser;
 use crate::log_scanner::parser::nginx::NginxAccessParser;
 use crate::log_scanner::tailer::{TailEvent, TailLine};
 
@@ -34,6 +35,16 @@ impl Scanner {
         }
     }
 
+    fn select_parser(file_path: &Path) -> Box<dyn LogParser> {
+        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if file_name == "auth.log" {
+            Box::new(AuthLogParser::new())
+        } else {
+            Box::new(NginxAccessParser::new())
+        }
+    }
+
     pub fn stop(&self) {
         self.cancel_token.cancel();
     }
@@ -43,7 +54,6 @@ impl Scanner {
         let service_repo = ServiceRepository::new(self.pool.clone());
         let filter = Arc::new(NoiseFilter::new());
         let classifier = Arc::new(Classifier::new());
-        let nginx_parser = Arc::new(NginxAccessParser::new());
 
         let mut batch: Vec<InsertLogEntry> = Vec::with_capacity(BATCH_SIZE);
         let mut flush_interval = tokio::time::interval(BATCH_INTERVAL);
@@ -67,9 +77,10 @@ impl Scanner {
                 Some(event) = rx.recv() => {
                     match event {
                         Ok(line) => {
+                            let parser = Self::select_parser(&line.file_path);
                             if let Err(e) = self.process_line(
                                 &line,
-                                &nginx_parser,
+                                &*parser,
                                 &filter,
                                 &classifier,
                                 &service_repo,
@@ -105,7 +116,7 @@ impl Scanner {
     async fn process_line(
         &self,
         line: &TailLine,
-        parser: &Arc<NginxAccessParser>,
+        parser: &dyn LogParser,
         filter: &Arc<NoiseFilter>,
         classifier: &Arc<Classifier>,
         service_repo: &ServiceRepository,
@@ -135,6 +146,7 @@ impl Scanner {
 
         let virtual_host = Self::extract_vhost_from_file_path(&line.file_path)
             .or_else(|| entry.metadata.virtual_host.clone());
+
         let service_id = if let Some(vhost) = &virtual_host {
             let service = crate::db::models::InsertService {
                 name: vhost.clone(),
@@ -150,7 +162,25 @@ impl Scanner {
                 }
             }
         } else {
-            None
+            let file_name = line
+                .file_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown-log")
+                .to_string();
+            let service = crate::db::models::InsertService {
+                name: file_name.clone(),
+                unit_type: "system-log".to_string(),
+                log_paths: None,
+                virtual_host: None,
+            };
+            match service_repo.get_or_create(&service).await {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    warn!("failed to get/create service '{}': {}", file_name, e);
+                    None
+                }
+            }
         };
 
         let level = Self::classify_level(entry.level, &threat_result);

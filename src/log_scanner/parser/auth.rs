@@ -19,6 +19,13 @@ impl Default for AuthLogParser {
     }
 }
 
+static ISO_SYSLOG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[\.\d]*[+-]\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<service>\S+?)(?:\[(?P<pid>\d+)\])?:\s+(?P<message>.*)$",
+    )
+    .expect("hardcoded ISO syslog regex must be valid")
+});
+
 static SYSLOG_TIMESTAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+(?P<host>\S+)\s+(?P<service>\S+?)(?:\[(?P<pid>\d+)\])?:\s+(?P<message>.*)$",
@@ -43,20 +50,31 @@ impl LogParser for AuthLogParser {
             return Ok(None);
         }
 
-        let caps = SYSLOG_TIMESTAMP_RE
-            .captures(line)
-            .ok_or(ParseError::InvalidFormat(
+        let (timestamp, service, message) = if let Some(caps) = ISO_SYSLOG_RE.captures(line) {
+            let ts_str = caps.name("timestamp").unwrap().as_str();
+            let timestamp = chrono::DateTime::parse_from_rfc3339(ts_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| ParseError::InvalidValue {
+                    field: "timestamp".to_string(),
+                    value: ts_str.to_string(),
+                })?;
+            let service = caps.name("service").unwrap().as_str().to_string();
+            let message = caps.name("message").unwrap().as_str().to_string();
+            (timestamp, service, message)
+        } else if let Some(caps) = SYSLOG_TIMESTAMP_RE.captures(line) {
+            let timestamp = parse_syslog_timestamp(
+                caps.name("month").unwrap().as_str(),
+                caps.name("day").unwrap().as_str(),
+                caps.name("time").unwrap().as_str(),
+            )?;
+            let service = caps.name("service").unwrap().as_str().to_string();
+            let message = caps.name("message").unwrap().as_str().to_string();
+            (timestamp, service, message)
+        } else {
+            return Err(ParseError::InvalidFormat(
                 "line does not match syslog format".to_string(),
-            ))?;
-
-        let timestamp = parse_syslog_timestamp(
-            caps.name("month").unwrap().as_str(),
-            caps.name("day").unwrap().as_str(),
-            caps.name("time").unwrap().as_str(),
-        )?;
-
-        let message = caps.name("message").unwrap().as_str().to_string();
-        let service = caps.name("service").unwrap().as_str().to_string();
+            ));
+        };
 
         let (level, client_ip) = classify_auth_message(&message);
 
@@ -69,7 +87,7 @@ impl LogParser for AuthLogParser {
             timestamp,
             source_name: "auth-log".to_string(),
             level,
-            message: format!("[{service}] {message}"),
+            message: format!("[{}] {}", service, message),
             raw: line.to_string(),
             metadata,
         }))

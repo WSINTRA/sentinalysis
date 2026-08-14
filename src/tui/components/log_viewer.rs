@@ -39,13 +39,21 @@ pub struct LogViewer {
     pool: PgPool,
     _entry_tx: UnboundedSender<DisplayLogEntry>,
     virtual_hosts: Vec<VirtualHostInfo>,
+    system_logs: Vec<VirtualHostInfo>,
     host_state: ListState,
     log_entries: HashMap<String, Vec<DisplayLogEntry>>,
     log_state: ListState,
     selected_host: Option<String>,
+    selection_type: SelectionType,
     filter_mode: bool,
     filter_text: String,
     focus: PanelFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SelectionType {
+    VirtualHost,
+    SystemLog,
 }
 
 impl LogViewer {
@@ -61,10 +69,12 @@ impl LogViewer {
             pool,
             _entry_tx: entry_tx,
             virtual_hosts: Vec::new(),
+            system_logs: Vec::new(),
             host_state,
             log_entries: HashMap::new(),
             log_state,
             selected_host: None,
+            selection_type: SelectionType::VirtualHost,
             filter_mode: false,
             filter_text: String::new(),
             focus: PanelFocus::HostList,
@@ -145,30 +155,104 @@ impl LogViewer {
             .collect();
 
         info!("Loaded {} virtual hosts from log files", self.virtual_hosts.len());
+
+        self.load_system_logs().await?;
         Ok(())
     }
 
-    async fn load_recent_entries(&mut self, host: &str) -> Result<(), SentinelError> {
-        let db_entries: Vec<DbLogEntry> = sqlx::query_as(
+    async fn load_system_logs(&mut self) -> Result<(), SentinelError> {
+        let mut system_log_names = Vec::new();
+
+        let log_dir = Path::new(NGINX_LOG_DIR);
+        if let Ok(entries) = std::fs::read_dir(log_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name == "access.log" {
+                    system_log_names.push(file_name);
+                }
+            }
+        }
+
+        if Path::new("/var/log/auth.log").exists() {
+            system_log_names.push("auth.log".to_string());
+        }
+
+        system_log_names.sort();
+
+        if system_log_names.is_empty() {
+            self.system_logs = Vec::new();
+            return Ok(());
+        }
+
+        let names: Vec<String> = system_log_names.clone();
+        let db_counts: Vec<(String, i64)> = sqlx::query_as(
             r"
-            SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.virtual_host
+            SELECT s.name, COUNT(*) as cnt
             FROM log_entries le
             JOIN services s ON le.service_id = s.id
-            WHERE s.virtual_host = $1
-            ORDER BY le.id DESC
-            LIMIT $2
+            WHERE s.name = ANY($1) AND s.virtual_host IS NULL
+            GROUP BY s.name
             ",
         )
-        .bind(host)
-        .bind(MAX_ENTRIES_PER_HOST.try_into().unwrap_or(i64::MAX))
+        .bind(names)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| SentinelError::DatabaseError(e.to_string()))?;
 
+        let counts: HashMap<String, i64> = db_counts.into_iter().collect();
+
+        self.system_logs = system_log_names
+            .into_iter()
+            .map(|name| VirtualHostInfo {
+                name: name.clone(),
+                source: VirtualHostSource::SystemdService,
+                entry_count: counts.get(&name).copied().unwrap_or(0) as usize,
+            })
+            .collect();
+
+        info!("Loaded {} system logs", self.system_logs.len());
+        Ok(())
+    }
+
+    async fn load_recent_entries(&mut self, name: &str) -> Result<(), SentinelError> {
+        let db_entries: Vec<DbLogEntry> = if self.selection_type == SelectionType::SystemLog {
+            sqlx::query_as(
+                r"
+                SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.name as virtual_host
+                FROM log_entries le
+                JOIN services s ON le.service_id = s.id
+                WHERE s.name = $1 AND s.virtual_host IS NULL
+                ORDER BY le.id DESC
+                LIMIT $2
+                ",
+            )
+            .bind(name)
+            .bind(MAX_ENTRIES_PER_HOST.try_into().unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SentinelError::DatabaseError(e.to_string()))?
+        } else {
+            sqlx::query_as(
+                r"
+                SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.virtual_host
+                FROM log_entries le
+                JOIN services s ON le.service_id = s.id
+                WHERE s.virtual_host = $1
+                ORDER BY le.id DESC
+                LIMIT $2
+                ",
+            )
+            .bind(name)
+            .bind(MAX_ENTRIES_PER_HOST.try_into().unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SentinelError::DatabaseError(e.to_string()))?
+        };
+
         let entries: Vec<DisplayLogEntry> = db_entries.into_iter().map(Self::db_to_display).collect();
 
-        info!("Loaded {} entries for '{host}'", entries.len());
-        self.log_entries.insert(host.to_string(), entries);
+        info!("Loaded {} entries for '{name}'", entries.len());
+        self.log_entries.insert(name.to_string(), entries);
         self.log_state.select(Some(0));
         Ok(())
     }
@@ -244,18 +328,23 @@ impl LogViewer {
     }
 
     fn render_host_list(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let items: Vec<ListItem> = self
-            .virtual_hosts
-            .iter()
-            .map(|h| {
-                let source_icon = match h.source {
-                    VirtualHostSource::LogEntry => "[L]",
-                    VirtualHostSource::SystemdService => "[S]",
-                    VirtualHostSource::JournalctlConfig => "[J]",
-                };
-                ListItem::new(Line::raw(format!("{source_icon} {}", h.name)))
-            })
-            .collect();
+        let mut items: Vec<ListItem> = Vec::new();
+
+        items.push(ListItem::new(
+            Line::raw("Virtual Hosts").style(Style::new().add_modifier(Modifier::BOLD)),
+        ));
+        for h in &self.virtual_hosts {
+            items.push(ListItem::new(Line::raw(format!("[L] {}", h.name))));
+        }
+
+        if !self.system_logs.is_empty() {
+            items.push(ListItem::new(
+                Line::raw("System Logs").style(Style::new().add_modifier(Modifier::BOLD)),
+            ));
+            for h in &self.system_logs {
+                items.push(ListItem::new(Line::raw(format!("[S] {}", h.name))));
+            }
+        }
 
         let focused = self.focus == PanelFocus::HostList;
         let border_style = if focused {
@@ -268,7 +357,7 @@ impl LogViewer {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Virtual Hosts")
+                    .title("Sources")
                     .border_style(border_style),
             )
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
@@ -325,6 +414,89 @@ impl LogViewer {
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
 
         frame.render_stateful_widget(list, area, &mut self.log_state);
+    }
+}
+
+impl LogViewer {
+    fn total_host_list_len(&self) -> usize {
+        let mut len = 1 + self.virtual_hosts.len();
+        if !self.system_logs.is_empty() {
+            len += 1 + self.system_logs.len();
+        }
+        len
+    }
+
+    fn resolve_selection(&self, index: usize) -> Option<(String, SelectionType)> {
+        let mut current = 0;
+
+        current += 1;
+        if index < current {
+            return self.virtual_hosts.get(index).map(|h| (h.name.clone(), SelectionType::VirtualHost));
+        }
+
+        if !self.system_logs.is_empty() {
+            current += 1;
+            if index < current + self.system_logs.len() {
+                let sys_idx = index - current;
+                return self.system_logs.get(sys_idx).map(|h| (h.name.clone(), SelectionType::SystemLog));
+            }
+        }
+
+        None
+    }
+
+    async fn check_new_entries(&mut self, name: &str, selection_type: SelectionType) -> Result<(), SentinelError> {
+        let current_entries = self.log_entries.get(name).cloned().unwrap_or_default();
+        if current_entries.is_empty() {
+            return Ok(());
+        }
+
+        let oldest_id = current_entries.first().map(|e| e.id);
+        let Some(oldest_id) = oldest_id else {
+            return Ok(());
+        };
+
+        let query = if selection_type == SelectionType::SystemLog {
+            r"
+            SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.name as virtual_host
+            FROM log_entries le
+            JOIN services s ON le.service_id = s.id
+            WHERE s.name = $1 AND s.virtual_host IS NULL AND le.id > $2
+            ORDER BY le.id DESC
+            LIMIT 100
+            "
+        } else {
+            r"
+            SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.virtual_host
+            FROM log_entries le
+            JOIN services s ON le.service_id = s.id
+            WHERE s.virtual_host = $1 AND le.id > $2
+            ORDER BY le.id DESC
+            LIMIT 100
+            "
+        };
+
+        let new_db_entries: Vec<DbLogEntry> = sqlx::query_as(query)
+            .bind(name)
+            .bind(oldest_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SentinelError::DatabaseError(e.to_string()))?;
+
+        if new_db_entries.is_empty() {
+            return Ok(());
+        }
+
+        let new_entries: Vec<DisplayLogEntry> = new_db_entries.into_iter().map(Self::db_to_display).collect();
+
+        if let Some(host_entries) = self.log_entries.get_mut(name) {
+            host_entries.splice(0..0, new_entries);
+            if host_entries.len() > MAX_ENTRIES_PER_HOST {
+                host_entries.truncate(MAX_ENTRIES_PER_HOST);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -399,8 +571,8 @@ impl Component for LogViewer {
                 match self.focus {
                     PanelFocus::HostList => {
                         if let Some(i) = self.host_state.selected() {
-                            self.host_state
-                                .select(Some((i + 1).min(self.virtual_hosts.len().saturating_sub(1))));
+                            let max = self.total_host_list_len().saturating_sub(1);
+                            self.host_state.select(Some((i + 1).min(max)));
                         }
                     }
                     PanelFocus::LogList => {
@@ -417,15 +589,17 @@ impl Component for LogViewer {
                 Ok(None)
             }
             Action::Refresh => {
-                if let Some(selected) = self.host_state.selected()
-                    && let Some(host) = self.virtual_hosts.get(selected).map(|h| h.name.clone())
-                    && self.selected_host.as_ref() != Some(&host)
-                {
-                    self.selected_host = Some(host.clone());
-                    self.log_state.select(Some(0));
-                    let _ = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(self.load_recent_entries(&host))
-                    });
+                if let Some(selected) = self.host_state.selected() {
+                    if let Some((name, selection_type)) = self.resolve_selection(selected) {
+                        if self.selected_host.as_ref() != Some(&name) {
+                            self.selected_host = Some(name.clone());
+                            self.selection_type = selection_type;
+                            self.log_state.select(Some(0));
+                            let _ = tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current().block_on(self.load_recent_entries(&name))
+                            });
+                        }
+                    }
                 }
                 Ok(None)
             }
@@ -465,6 +639,16 @@ impl Component for LogViewer {
                     .and_then(|h| self.log_entries.get(h).map(|v| v.len().saturating_sub(1)))
                 {
                     self.log_state.select(Some(max));
+                }
+                Ok(None)
+            }
+            Action::Tick => {
+                if let Some(ref selected) = self.selected_host {
+                    let st = self.selection_type;
+                    let name = selected.clone();
+                    let _ = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(self.check_new_entries(&name, st))
+                    });
                 }
                 Ok(None)
             }

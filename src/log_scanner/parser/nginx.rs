@@ -20,7 +20,7 @@ impl Default for NginxAccessParser {
 
 static NGINX_COMBINED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"^(?P<remote_addr>\S+) \S+ \S+ \[(?P<time_local>[^\]]+)\] "(?P<request>[^"]*)" (?P<status>\d{3}) (?P<body_bytes_sent>\d+) "(?P<http_referer>[^"]*)" "(?P<http_user_agent>[^"]*)" "(?P<host>[^"]*)" (?P<request_time>[\d.]+)$"#,
+        r#"^(?P<remote_addr>\S+) \S+ \S+ \[(?P<time_local>[^\]]+)\] "(?P<request>[^"]*)" (?P<status>\d{3}) (?P<body_bytes_sent>\d+) "(?P<http_referer>[^"]*)" "(?P<http_user_agent>[^"]*)"(?: "(?P<host>[^"]*)" (?P<request_time>[\d.]+))?$"#,
     )
     .expect("hardcoded nginx combined log regex must be valid")
 });
@@ -83,20 +83,15 @@ impl LogParser for NginxAccessParser {
 
         let level = classify_status(status);
 
-        let virtual_host = Some(caps.name("host").unwrap().as_str().to_string());
+        let virtual_host = caps
+            .name("host")
+            .filter(|m| m.as_str() != "-")
+            .map(|m| m.as_str().to_string());
 
-        let request_time: f64 = caps
+        let response_time_ms = caps
             .name("request_time")
-            .unwrap()
-            .as_str()
-            .parse()
-            .map_err(|_| ParseError::InvalidValue {
-                field: "request_time".to_string(),
-                value: caps.name("request_time").unwrap().as_str().to_string(),
-            })?;
-
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let response_time_ms = (request_time * 1000.0).round() as u64;
+            .and_then(|m| m.as_str().parse::<f64>().ok())
+            .map(|rt| (rt * 1000.0).round() as u64);
 
         let metadata = LogMetadata {
             client_ip: Some(remote_addr),
@@ -104,7 +99,7 @@ impl LogParser for NginxAccessParser {
             request_path: path.clone(),
             status_code: Some(status),
             bytes_sent: Some(bytes_sent),
-            response_time_ms: Some(response_time_ms),
+            response_time_ms,
             user_agent: Some(caps.name("http_user_agent").unwrap().as_str().to_string()),
             referer: Some(caps.name("http_referer").unwrap().as_str().to_string()),
             virtual_host,
