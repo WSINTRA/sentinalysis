@@ -27,6 +27,8 @@ pub struct LogEntry {
     pub response_time_ms: Option<i64>,
     pub is_noise: bool,
     pub noise_reason: Option<String>,
+    pub threat_level: String,
+    pub threat_categories: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -91,6 +93,10 @@ pub struct InsertLogEntry {
     pub response_time_ms: Option<i64>,
     pub is_noise: bool,
     pub noise_reason: Option<String>,
+    /// Stored threat level (see `ThreatLevel::as_str`); `'none'` when clean.
+    pub threat_level: String,
+    /// Stored threat categories (see `ThreatCategory::as_str`).
+    pub threat_categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +125,8 @@ mod tests {
             response_time_ms: None,
             is_noise: false,
             noise_reason: None,
+            threat_level: "none".to_string(),
+            threat_categories: Vec::new(),
         };
         assert_eq!(entry.level, "info");
         assert!(!entry.is_noise);
@@ -138,6 +146,8 @@ mod tests {
             response_time_ms: None,
             is_noise: true,
             noise_reason: Some("health_check".to_string()),
+            threat_level: "none".to_string(),
+            threat_categories: Vec::new(),
         };
         assert!(entry.is_noise);
         assert!(entry.raw_line.is_none());

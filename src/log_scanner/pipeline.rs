@@ -293,6 +293,12 @@ impl Pipeline {
                 response_time_ms: entry.metadata.response_time_ms.map(|ms| ms as i64),
                 is_noise,
                 noise_reason,
+                threat_level: threat.threat_level.as_str().to_string(),
+                threat_categories: threat
+                    .categories
+                    .iter()
+                    .map(|c| c.as_str().to_string())
+                    .collect(),
             }))
         })
     }
@@ -370,6 +376,8 @@ mod tests {
         assert!(!entry.is_noise);
         assert!(entry.raw_line.is_some());
         assert!(entry.service_id.is_some());
+        assert_eq!(entry.threat_level, "none");
+        assert!(entry.threat_categories.is_empty());
     }
 
     #[tokio::test]
@@ -404,6 +412,8 @@ mod tests {
 
         assert_eq!(entry.level, "security");
         assert_eq!(entry.client_ip, Some("192.168.1.100".to_string()));
+        assert_eq!(entry.threat_level, "medium");
+        assert_eq!(entry.threat_categories, vec!["brute-force"]);
     }
 
     #[tokio::test]
@@ -433,6 +443,8 @@ mod tests {
         let entry = p.process_line(&line).await.unwrap().unwrap();
 
         assert_eq!(entry.level, "security");
+        assert_eq!(entry.threat_level, "high");
+        assert_eq!(entry.threat_categories, vec!["sql-injection"]);
     }
 
     #[tokio::test]

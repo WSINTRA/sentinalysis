@@ -46,7 +46,10 @@ async fn run() -> Result<(), SentinelError> {
     init_tracing();
 
     let config = load_config(&cli.config)?;
-    let pool = create_pool().await?;
+    let database_url = std::env::var("DATABASE_URL").map_err(|_| {
+        SentinelError::ConfigError("DATABASE_URL environment variable not set".into())
+    })?;
+    let pool = create_pool(&database_url).await?;
 
     info!(
         "Sentinel starting in {} mode",

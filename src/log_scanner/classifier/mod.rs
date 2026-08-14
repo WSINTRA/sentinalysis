@@ -39,6 +39,32 @@ impl fmt::Display for ThreatLevel {
     }
 }
 
+impl ThreatLevel {
+    /// The lowercase name stored in `log_entries.threat_level`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThreatLevel::None => "none",
+            ThreatLevel::Low => "low",
+            ThreatLevel::Medium => "medium",
+            ThreatLevel::High => "high",
+            ThreatLevel::Critical => "critical",
+        }
+    }
+
+    /// Parse a stored level; unknown values map to [`ThreatLevel::None`].
+    #[must_use]
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "low" => ThreatLevel::Low,
+            "medium" => ThreatLevel::Medium,
+            "high" => ThreatLevel::High,
+            "critical" => ThreatLevel::Critical,
+            _ => ThreatLevel::None,
+        }
+    }
+}
+
 /// The kind of threat a log entry may indicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThreatCategory {
@@ -70,6 +96,22 @@ impl fmt::Display for ThreatCategory {
 }
 
 impl ThreatCategory {
+    /// The kebab-case name stored in `log_entries.threat_categories`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThreatCategory::SqlInjection => "sql-injection",
+            ThreatCategory::Xss => "xss",
+            ThreatCategory::PathTraversal => "path-traversal",
+            ThreatCategory::CommandInjection => "command-injection",
+            ThreatCategory::BruteForce => "brute-force",
+            ThreatCategory::Scanner => "scanner",
+            ThreatCategory::SensitiveFile => "sensitive-file",
+            ThreatCategory::TlsError => "tls-error",
+            ThreatCategory::SuspiciousPattern => "suspicious-pattern",
+        }
+    }
+
     /// Severity tier implied by this category on its own.
     fn severity(self) -> ThreatLevel {
         match self {
@@ -697,5 +739,43 @@ mod tests {
                 prop_assert_eq!(first, second);
             }
         }
+    }
+
+    /// The DB round-trip (`as_str` → `from_db`) must be lossless for every
+    /// level, and unknown stored values must fall back to `None`.
+    #[test]
+    fn test_threat_level_db_roundtrip() {
+        for level in [
+            ThreatLevel::None,
+            ThreatLevel::Low,
+            ThreatLevel::Medium,
+            ThreatLevel::High,
+            ThreatLevel::Critical,
+        ] {
+            assert_eq!(ThreatLevel::from_db(level.as_str()), level);
+        }
+        assert_eq!(ThreatLevel::from_db("bogus"), ThreatLevel::None);
+        assert_eq!(ThreatLevel::from_db(""), ThreatLevel::None);
+    }
+
+    /// Every category name stored in the DB must be unique and stable.
+    #[test]
+    fn test_threat_category_as_str_is_unique() {
+        let categories = [
+            ThreatCategory::SqlInjection,
+            ThreatCategory::Xss,
+            ThreatCategory::PathTraversal,
+            ThreatCategory::CommandInjection,
+            ThreatCategory::BruteForce,
+            ThreatCategory::Scanner,
+            ThreatCategory::SensitiveFile,
+            ThreatCategory::TlsError,
+            ThreatCategory::SuspiciousPattern,
+        ];
+        let names: Vec<&str> = categories.iter().map(|c| c.as_str()).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "duplicate category names");
     }
 }

@@ -9,6 +9,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info};
 
+use crate::db::repositories::log_query_repo::{LogEntryRow, LogQueryRepository, LogSourceKind};
 use crate::error::SentinelError;
 use crate::log_scanner::classifier::ThreatLevel;
 use crate::log_scanner::parser::LogLevel;
@@ -17,6 +18,8 @@ use crate::tui::app::{DisplayLogEntry, VirtualHostInfo, VirtualHostSource};
 use crate::tui::components::{BoxedFuture, Component};
 
 const MAX_ENTRIES_PER_HOST: usize = 1000;
+/// Max entries fetched per poll for a single host.
+const NEW_ENTRIES_PER_POLL: i64 = 100;
 const NGINX_LOG_DIR: &str = "/var/log/nginx";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,18 +28,8 @@ enum PanelFocus {
     LogList,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct DbLogEntry {
-    id: uuid::Uuid,
-    timestamp: chrono::DateTime<chrono::Utc>,
-    level: String,
-    message: String,
-    raw_line: Option<String>,
-    virtual_host: String,
-}
-
 pub struct LogViewer {
-    pool: PgPool,
+    repo: LogQueryRepository,
     _entry_tx: UnboundedSender<DisplayLogEntry>,
     virtual_hosts: Vec<VirtualHostInfo>,
     system_logs: Vec<VirtualHostInfo>,
@@ -66,7 +59,7 @@ impl LogViewer {
         log_state.select(Some(0));
 
         Self {
-            pool,
+            repo: LogQueryRepository::new(pool),
             _entry_tx: entry_tx,
             virtual_hosts: Vec::new(),
             system_logs: Vec::new(),
@@ -129,18 +122,10 @@ impl LogViewer {
         }
 
         let hosts: Vec<String> = discovered_hosts.clone();
-        let db_counts: Vec<(String, i64)> = sqlx::query_as(
-            r"
-            SELECT s.virtual_host, COUNT(*) as cnt
-            FROM log_entries le
-            JOIN services s ON le.service_id = s.id
-            WHERE s.virtual_host = ANY($1)
-            GROUP BY s.virtual_host
-            ",
-        )
-        .bind(hosts)
-        .fetch_all(&self.pool)
-        .await?;
+        let db_counts: Vec<(String, i64)> = self
+            .repo
+            .count_entries(LogSourceKind::Vhost, &hosts)
+            .await?;
 
         let counts: HashMap<String, i64> = db_counts.into_iter().collect();
 
@@ -187,18 +172,10 @@ impl LogViewer {
         }
 
         let names: Vec<String> = system_log_names.clone();
-        let db_counts: Vec<(String, i64)> = sqlx::query_as(
-            r"
-            SELECT s.name, COUNT(*) as cnt
-            FROM log_entries le
-            JOIN services s ON le.service_id = s.id
-            WHERE s.name = ANY($1) AND s.virtual_host IS NULL
-            GROUP BY s.name
-            ",
-        )
-        .bind(names)
-        .fetch_all(&self.pool)
-        .await?;
+        let db_counts: Vec<(String, i64)> = self
+            .repo
+            .count_entries(LogSourceKind::SystemLog, &names)
+            .await?;
 
         let counts: HashMap<String, i64> = db_counts.into_iter().collect();
 
@@ -216,40 +193,11 @@ impl LogViewer {
     }
 
     async fn load_recent_entries(&mut self, name: &str) -> Result<(), SentinelError> {
-        let db_entries: Vec<DbLogEntry> = if self.selection_type == SelectionType::SystemLog {
-            sqlx::query_as(
-                r"
-                SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.name as virtual_host
-                FROM log_entries le
-                JOIN services s ON le.service_id = s.id
-                WHERE s.name = $1 AND s.virtual_host IS NULL
-                ORDER BY le.id DESC
-                LIMIT $2
-                ",
-            )
-            .bind(name)
-            .bind(MAX_ENTRIES_PER_HOST.try_into().unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                r"
-                SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.virtual_host
-                FROM log_entries le
-                JOIN services s ON le.service_id = s.id
-                WHERE s.virtual_host = $1
-                ORDER BY le.id DESC
-                LIMIT $2
-                ",
-            )
-            .bind(name)
-            .bind(MAX_ENTRIES_PER_HOST.try_into().unwrap_or(i64::MAX))
-            .fetch_all(&self.pool)
-            .await?
-        };
+        let kind = self.source_kind();
+        let limit = i64::try_from(MAX_ENTRIES_PER_HOST).unwrap_or(i64::MAX);
 
-        let entries: Vec<DisplayLogEntry> =
-            db_entries.into_iter().map(Self::db_to_display).collect();
+        let rows = self.repo.recent_entries(kind, name, limit).await?;
+        let entries: Vec<DisplayLogEntry> = rows.into_iter().map(Self::row_to_display).collect();
 
         info!("Loaded {} entries for '{name}'", entries.len());
         self.log_entries.insert(name.to_string(), entries);
@@ -257,8 +205,8 @@ impl LogViewer {
         Ok(())
     }
 
-    fn db_to_display(db: DbLogEntry) -> DisplayLogEntry {
-        let level = match db.level.as_str() {
+    fn row_to_display(row: LogEntryRow) -> DisplayLogEntry {
+        let level = match row.level.as_str() {
             "debug" => LogLevel::Debug,
             "warn" => LogLevel::Warn,
             "error" => LogLevel::Error,
@@ -268,14 +216,14 @@ impl LogViewer {
         };
 
         DisplayLogEntry {
-            id: db.id,
-            timestamp: db.timestamp,
+            id: row.id,
+            timestamp: row.timestamp,
             level,
-            threat_level: ThreatLevel::None,
-            message: db.message,
-            raw: db.raw_line.unwrap_or_default(),
-            virtual_host: db.virtual_host,
-            threat_categories: Vec::new(),
+            threat_level: ThreatLevel::from_db(&row.threat_level),
+            message: row.message,
+            raw: row.raw_line.unwrap_or_default(),
+            virtual_host: row.source_name,
+            threat_categories: row.threat_categories,
         }
     }
 
@@ -457,55 +405,46 @@ impl LogViewer {
         None
     }
 
+    /// The repository source kind for the current selection.
+    fn source_kind(&self) -> LogSourceKind {
+        match self.selection_type {
+            SelectionType::SystemLog => LogSourceKind::SystemLog,
+            SelectionType::VirtualHost => LogSourceKind::Vhost,
+        }
+    }
+
     async fn check_new_entries(
         &mut self,
         name: &str,
         selection_type: SelectionType,
     ) -> Result<(), SentinelError> {
-        let current_entries = self.log_entries.get(name).cloned().unwrap_or_default();
-        if current_entries.is_empty() {
-            return Ok(());
-        }
-
-        let oldest_id = current_entries.first().map(|e| e.id);
-        let Some(oldest_id) = oldest_id else {
+        // Entries are stored newest-first, so the last one is the oldest on
+        // screen; everything newer than it is still missing.
+        let Some((since, since_id)) = self
+            .log_entries
+            .get(name)
+            .and_then(|entries| entries.last())
+            .map(|oldest| (oldest.timestamp, oldest.id))
+        else {
             return Ok(());
         };
 
-        let query = if selection_type == SelectionType::SystemLog {
-            r"
-            SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.name as virtual_host
-            FROM log_entries le
-            JOIN services s ON le.service_id = s.id
-            WHERE s.name = $1 AND s.virtual_host IS NULL AND le.id > $2
-            ORDER BY le.id DESC
-            LIMIT 100
-            "
-        } else {
-            r"
-            SELECT le.id, le.timestamp, le.level, le.message, le.raw_line, s.virtual_host
-            FROM log_entries le
-            JOIN services s ON le.service_id = s.id
-            WHERE s.virtual_host = $1 AND le.id > $2
-            ORDER BY le.id DESC
-            LIMIT 100
-            "
+        let kind = match selection_type {
+            SelectionType::SystemLog => LogSourceKind::SystemLog,
+            SelectionType::VirtualHost => LogSourceKind::Vhost,
         };
 
-        let new_db_entries: Vec<DbLogEntry> = sqlx::query_as(query)
-            .bind(name)
-            .bind(oldest_id)
-            .fetch_all(&self.pool)
+        let new_rows = self
+            .repo
+            .newer_entries(kind, name, since, since_id, NEW_ENTRIES_PER_POLL)
             .await?;
 
-        if new_db_entries.is_empty() {
+        if new_rows.is_empty() {
             return Ok(());
         }
 
-        let new_entries: Vec<DisplayLogEntry> = new_db_entries
-            .into_iter()
-            .map(Self::db_to_display)
-            .collect();
+        let new_entries: Vec<DisplayLogEntry> =
+            new_rows.into_iter().map(Self::row_to_display).collect();
 
         if let Some(host_entries) = self.log_entries.get_mut(name) {
             host_entries.splice(0..0, new_entries);
