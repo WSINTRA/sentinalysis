@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind};
 use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -30,9 +30,8 @@ pub struct Tui {
 
 impl Tui {
     pub fn new() -> Result<Self, SentinelError> {
-        let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout())).map_err(|e| {
-            SentinelError::Internal(format!("failed to initialize terminal: {e}"))
-        })?;
+        let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))
+            .map_err(|e| SentinelError::Internal(format!("failed to initialize terminal: {e}")))?;
 
         let (event_tx, event_rx) = mpsc::channel(100);
         let cancel_token = CancellationToken::new();
@@ -59,10 +58,7 @@ impl Tui {
         Ok(())
     }
 
-    fn start_event_listener(
-        event_tx: mpsc::Sender<Event>,
-        cancel_token: CancellationToken,
-    ) {
+    fn start_event_listener(event_tx: mpsc::Sender<Event>, cancel_token: CancellationToken) {
         tokio::spawn(async move {
             let mut event_stream = EventStream::new();
             let mut tick_interval = tokio::time::interval(Duration::from_millis(100));

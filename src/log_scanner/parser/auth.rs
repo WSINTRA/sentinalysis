@@ -87,7 +87,7 @@ impl LogParser for AuthLogParser {
             timestamp,
             source_name: "auth-log".to_string(),
             level,
-            message: format!("[{}] {}", service, message),
+            message: format!("[{service}] {message}"),
             raw: line.to_string(),
             metadata,
         }))

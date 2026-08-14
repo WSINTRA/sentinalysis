@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn test_error_debug_format() {
         let err = SentinelError::ParseError("test".to_string());
-        let debug = format!("{:?}", err);
+        let debug = format!("{err:?}");
         assert!(debug.contains("ParseError"));
     }
 }

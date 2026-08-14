@@ -438,7 +438,7 @@ mod tests {
             LogLevel::Info,
             LogMetadata {
                 client_ip: Some(ip),
-                ..Default::default()
+                ..LogMetadata::default()
             },
         )
     }
@@ -449,7 +449,7 @@ mod tests {
             LogLevel::Info,
             LogMetadata {
                 request_path: Some(path.into()),
-                ..Default::default()
+                ..LogMetadata::default()
             },
         )
     }
@@ -460,7 +460,7 @@ mod tests {
             LogLevel::Info,
             LogMetadata {
                 user_agent: Some(ua.into()),
-                ..Default::default()
+                ..LogMetadata::default()
             },
         )
     }
@@ -473,7 +473,7 @@ mod tests {
             LogMetadata {
                 request_path: Some(path.into()),
                 status_code: Some(status),
-                ..Default::default()
+                ..LogMetadata::default()
             },
         )
     }
@@ -487,7 +487,11 @@ mod tests {
     #[test]
     fn test_classify_normal_request() {
         let classifier = Classifier::new();
-        let entry = make_entry("GET /index.html 200", LogLevel::Info, Default::default());
+        let entry = make_entry(
+            "GET /index.html 200",
+            LogLevel::Info,
+            LogMetadata::default(),
+        );
         let result = classifier.classify(&entry);
 
         assert_eq!(result.threat_level, ThreatLevel::None);
@@ -512,13 +516,11 @@ mod tests {
             let result = classifier.classify(&entry);
             assert!(
                 result.threat_level >= ThreatLevel::High,
-                "Expected high threat for SQL injection in path: {}",
-                path
+                "Expected high threat for SQL injection in path: {path}"
             );
             assert!(
                 result.categories.contains(&ThreatCategory::SqlInjection),
-                "Expected SqlInjection category for: {}",
-                path
+                "Expected SqlInjection category for: {path}"
             );
         }
     }
@@ -540,13 +542,11 @@ mod tests {
             let result = classifier.classify(&entry);
             assert!(
                 result.threat_level >= ThreatLevel::High,
-                "Expected high threat for XSS in path: {}",
-                path
+                "Expected high threat for XSS in path: {path}"
             );
             assert!(
                 result.categories.contains(&ThreatCategory::Xss),
-                "Expected Xss category for: {}",
-                path
+                "Expected Xss category for: {path}"
             );
         }
     }
@@ -568,13 +568,11 @@ mod tests {
             let result = classifier.classify(&entry);
             assert!(
                 result.threat_level >= ThreatLevel::High,
-                "Expected high threat for path traversal: {}",
-                path
+                "Expected high threat for path traversal: {path}"
             );
             assert!(
                 result.categories.contains(&ThreatCategory::PathTraversal),
-                "Expected PathTraversal category for: {}",
-                path
+                "Expected PathTraversal category for: {path}"
             );
         }
     }
@@ -598,14 +596,11 @@ mod tests {
             let result = classifier.classify(&entry);
             assert!(
                 result.threat_level >= expected_min,
-                "Expected >= {:?} for UA: {}",
-                expected_min,
-                ua
+                "Expected >= {expected_min:?} for UA: {ua}"
             );
             assert!(
                 result.categories.contains(&ThreatCategory::Scanner),
-                "Expected Scanner category for UA: {}",
-                ua
+                "Expected Scanner category for UA: {ua}"
             );
         }
     }
@@ -625,17 +620,15 @@ mod tests {
         ];
 
         for (msg, level) in cases {
-            let entry = make_entry(msg, level, Default::default());
+            let entry = make_entry(msg, level, LogMetadata::default());
             let result = classifier.classify(&entry);
             assert!(
                 result.threat_level >= ThreatLevel::Medium,
-                "Expected medium threat for brute force indicator: {}",
-                msg
+                "Expected medium threat for brute force indicator: {msg}"
             );
             assert!(
                 result.categories.contains(&ThreatCategory::BruteForce),
-                "Expected BruteForce category for: {}",
-                msg
+                "Expected BruteForce category for: {msg}"
             );
         }
     }
@@ -681,15 +674,13 @@ mod tests {
             let result = classifier.classify(&entry);
             assert!(
                 result.threat_level >= ThreatLevel::Critical,
-                "Expected critical threat for command injection: {}",
-                path
+                "Expected critical threat for command injection: {path}"
             );
             assert!(
                 result
                     .categories
                     .contains(&ThreatCategory::CommandInjection),
-                "Expected CommandInjection category for: {}",
-                path
+                "Expected CommandInjection category for: {path}"
             );
         }
     }
@@ -712,13 +703,11 @@ mod tests {
             let result = classifier.classify(&entry);
             assert!(
                 result.threat_level >= ThreatLevel::Medium,
-                "Expected medium threat for sensitive file access: {}",
-                path
+                "Expected medium threat for sensitive file access: {path}"
             );
             assert!(
                 result.categories.contains(&ThreatCategory::SensitiveFile),
-                "Expected SensitiveFile category for: {}",
-                path
+                "Expected SensitiveFile category for: {path}"
             );
         }
 
@@ -728,13 +717,11 @@ mod tests {
             let result = classifier.classify(&entry);
             assert!(
                 result.threat_level >= ThreatLevel::High,
-                "Expected high threat for system file access: {}",
-                path
+                "Expected high threat for system file access: {path}"
             );
             assert!(
                 result.categories.contains(&ThreatCategory::PathTraversal),
-                "Expected PathTraversal for system file: {}",
-                path
+                "Expected PathTraversal for system file: {path}"
             );
         }
     }
@@ -750,7 +737,7 @@ mod tests {
         ];
 
         for (msg, level) in cases {
-            let entry = make_entry(msg, level, Default::default());
+            let entry = make_entry(msg, level, LogMetadata::default());
             let result = classifier.classify(&entry);
             assert!(result.threat_level >= ThreatLevel::Low);
         }
@@ -785,7 +772,7 @@ mod tests {
             categories: vec![ThreatCategory::SqlInjection],
             confidence: 0.95,
         };
-        let display = format!("{}", result);
+        let display = format!("{result}");
         assert!(display.contains("High"));
         assert!(display.contains("SqlInjection"));
     }

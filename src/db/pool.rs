@@ -24,23 +24,31 @@ pub async fn health_check(pool: &PgPool) -> Result<(), SentinelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Serialises tests that mutate the process environment, since env vars
+    /// are process-global. A tokio mutex is used so the guard can be held
+    /// across the `create_pool` await without blocking the runtime.
+    static ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    async fn lock_env() -> tokio::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.get_or_init(Default::default).lock().await
+    }
+
+    fn set_database_url(value: Option<&str>) -> Option<String> {
+        let original = std::env::var("DATABASE_URL").ok();
+        match value {
+            Some(url) => unsafe { std::env::set_var("DATABASE_URL", url) },
+            None => unsafe { std::env::remove_var("DATABASE_URL") },
+        }
+        original
+    }
 
     #[tokio::test]
     async fn test_create_pool_missing_env_fails() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let original = std::env::var("DATABASE_URL").ok();
-        unsafe {
-            std::env::remove_var("DATABASE_URL");
-        }
+        let _guard = lock_env().await;
+        let original = set_database_url(None);
         let result = create_pool().await;
-        if let Some(val) = original {
-            unsafe {
-                std::env::set_var("DATABASE_URL", val);
-            }
-        }
+        set_database_url(original.as_deref());
         assert!(result.is_err());
         match result {
             Err(SentinelError::ConfigError(msg)) => {
@@ -52,16 +60,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_pool_invalid_url_fails() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let original = std::env::var("DATABASE_URL").ok();
-        unsafe {
-            std::env::set_var("DATABASE_URL", "postgresql://invalid:5432/nonexistent");
-        }
+        let _guard = lock_env().await;
+        let original = set_database_url(Some("postgresql://invalid:5432/nonexistent"));
         let result = create_pool().await;
-        match original {
-            Some(val) => unsafe { std::env::set_var("DATABASE_URL", val) },
-            None => unsafe { std::env::remove_var("DATABASE_URL") },
-        }
+        set_database_url(original.as_deref());
         assert!(result.is_err());
         match result {
             Err(SentinelError::DatabaseError(_)) => {}

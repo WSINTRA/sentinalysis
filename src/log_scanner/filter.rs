@@ -152,7 +152,7 @@ mod tests {
                 LogLevel::Info
             },
             message: format!("GET {path} {status}"),
-            raw: "".to_string(),
+            raw: String::new(),
             metadata: LogMetadata {
                 client_ip: Some(ip),
                 request_method: Some("GET".to_string()),

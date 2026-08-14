@@ -35,7 +35,10 @@ impl StatusBar {
 }
 
 impl Component for StatusBar {
-    fn handle_action(&mut self, _action: &Action) -> Result<Option<Action>, crate::error::SentinelError> {
+    fn handle_action(
+        &mut self,
+        _action: &Action,
+    ) -> Result<Option<Action>, crate::error::SentinelError> {
         Ok(None)
     }
 

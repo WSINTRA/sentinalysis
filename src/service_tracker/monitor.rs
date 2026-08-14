@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_monitor_default() {
-        let monitor = ServiceMonitor::default();
+        let monitor = ServiceMonitor;
         let _ = &monitor;
     }
 
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_parse_pid_empty() {
-        assert_eq!(parse_pid(Some(&"".to_string())), None);
+        assert_eq!(parse_pid(Some(&String::new())), None);
     }
 
     #[test]
@@ -229,17 +229,17 @@ mod tests {
 
     #[test]
     fn test_parse_bytes_kilobytes() {
-        assert_eq!(parse_bytes(Some(&"1024K".to_string())), Some(1048576));
+        assert_eq!(parse_bytes(Some(&"1024K".to_string())), Some(1_048_576));
     }
 
     #[test]
     fn test_parse_bytes_megabytes() {
-        assert_eq!(parse_bytes(Some(&"1M".to_string())), Some(1048576));
+        assert_eq!(parse_bytes(Some(&"1M".to_string())), Some(1_048_576));
     }
 
     #[test]
     fn test_parse_bytes_gigabytes() {
-        assert_eq!(parse_bytes(Some(&"1G".to_string())), Some(1073741824));
+        assert_eq!(parse_bytes(Some(&"1G".to_string())), Some(1_073_741_824));
     }
 
     #[test]
@@ -271,7 +271,7 @@ mod tests {
             load_state: "loaded".to_string(),
             main_pid: Some(1234),
             restart_count: 3,
-            memory_current: Some(1048576),
+            memory_current: Some(1_048_576),
             cpu_usage_seconds: Some(1.5),
         };
         assert_eq!(status.name, "my-app");

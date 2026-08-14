@@ -122,14 +122,14 @@ impl Scanner {
         service_repo: &ServiceRepository,
         batch: &mut Vec<InsertLogEntry>,
     ) -> Result<(), SentinelError> {
-        let parsed = parser
-            .parse(&line.line)
-            .map_err(|e| SentinelError::ParseError(format!(
+        let parsed = parser.parse(&line.line).map_err(|e| {
+            SentinelError::ParseError(format!(
                 "{} [{}]: {}",
                 parser.name(),
                 line.file_path.display(),
                 e
-            )))?;
+            ))
+        })?;
 
         let Some(entry) = parsed else {
             return Ok(());

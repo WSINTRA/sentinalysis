@@ -108,7 +108,7 @@ impl LogViewer {
             }
         };
 
-        for entry in entries.filter_map(|e| e.ok()) {
+        for entry in entries.filter_map(std::result::Result::ok) {
             let file_name = entry.file_name().to_string_lossy().to_string();
             if file_name.ends_with("-access.log") && !file_name.ends_with("-access.log.1") {
                 let vhost_name = file_name.trim_end_matches("-access.log").to_string();
@@ -150,11 +150,14 @@ impl LogViewer {
             .map(|name| VirtualHostInfo {
                 name: name.clone(),
                 source: VirtualHostSource::LogEntry,
-                entry_count: counts.get(&name).copied().unwrap_or(0) as usize,
+                entry_count: usize::try_from(counts.get(&name).copied().unwrap_or(0)).unwrap_or(0),
             })
             .collect();
 
-        info!("Loaded {} virtual hosts from log files", self.virtual_hosts.len());
+        info!(
+            "Loaded {} virtual hosts from log files",
+            self.virtual_hosts.len()
+        );
 
         self.load_system_logs().await?;
         Ok(())
@@ -165,7 +168,7 @@ impl LogViewer {
 
         let log_dir = Path::new(NGINX_LOG_DIR);
         if let Ok(entries) = std::fs::read_dir(log_dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
+            for entry in entries.filter_map(std::result::Result::ok) {
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name == "access.log" {
                     system_log_names.push(file_name);
@@ -206,7 +209,7 @@ impl LogViewer {
             .map(|name| VirtualHostInfo {
                 name: name.clone(),
                 source: VirtualHostSource::SystemdService,
-                entry_count: counts.get(&name).copied().unwrap_or(0) as usize,
+                entry_count: usize::try_from(counts.get(&name).copied().unwrap_or(0)).unwrap_or(0),
             })
             .collect();
 
@@ -249,7 +252,8 @@ impl LogViewer {
             .map_err(|e| SentinelError::DatabaseError(e.to_string()))?
         };
 
-        let entries: Vec<DisplayLogEntry> = db_entries.into_iter().map(Self::db_to_display).collect();
+        let entries: Vec<DisplayLogEntry> =
+            db_entries.into_iter().map(Self::db_to_display).collect();
 
         info!("Loaded {} entries for '{name}'", entries.len());
         self.log_entries.insert(name.to_string(), entries);
@@ -321,7 +325,10 @@ impl LogViewer {
                 Self::get_level_style(entry.level, entry.threat_level),
             ),
             Span::raw(entry.message.clone()),
-            Span::styled(threat_badge, Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                threat_badge,
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
         ]);
 
         ListItem::new(line)
@@ -387,7 +394,10 @@ impl LogViewer {
                 .collect()
         };
 
-        let items: Vec<ListItem> = filtered.iter().map(|e| Self::entry_to_list_item(e)).collect();
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .map(|e| Self::entry_to_list_item(e))
+            .collect();
 
         let filter_indicator = if self.filter_mode {
             &format!(" [filter: '{}']", self.filter_text)[..]
@@ -431,21 +441,31 @@ impl LogViewer {
 
         current += 1;
         if index < current {
-            return self.virtual_hosts.get(index).map(|h| (h.name.clone(), SelectionType::VirtualHost));
+            return self
+                .virtual_hosts
+                .get(index)
+                .map(|h| (h.name.clone(), SelectionType::VirtualHost));
         }
 
         if !self.system_logs.is_empty() {
             current += 1;
             if index < current + self.system_logs.len() {
                 let sys_idx = index - current;
-                return self.system_logs.get(sys_idx).map(|h| (h.name.clone(), SelectionType::SystemLog));
+                return self
+                    .system_logs
+                    .get(sys_idx)
+                    .map(|h| (h.name.clone(), SelectionType::SystemLog));
             }
         }
 
         None
     }
 
-    async fn check_new_entries(&mut self, name: &str, selection_type: SelectionType) -> Result<(), SentinelError> {
+    async fn check_new_entries(
+        &mut self,
+        name: &str,
+        selection_type: SelectionType,
+    ) -> Result<(), SentinelError> {
         let current_entries = self.log_entries.get(name).cloned().unwrap_or_default();
         if current_entries.is_empty() {
             return Ok(());
@@ -487,7 +507,10 @@ impl LogViewer {
             return Ok(());
         }
 
-        let new_entries: Vec<DisplayLogEntry> = new_db_entries.into_iter().map(Self::db_to_display).collect();
+        let new_entries: Vec<DisplayLogEntry> = new_db_entries
+            .into_iter()
+            .map(Self::db_to_display)
+            .collect();
 
         if let Some(host_entries) = self.log_entries.get_mut(name) {
             host_entries.splice(0..0, new_entries);
@@ -497,6 +520,63 @@ impl LogViewer {
         }
 
         Ok(())
+    }
+
+    /// Highest valid index of the selected host's entry list (0 when empty).
+    fn log_list_max(&self) -> usize {
+        self.selected_host
+            .as_ref()
+            .and_then(|h| self.log_entries.get(h).map(|v| v.len().saturating_sub(1)))
+            .unwrap_or(0)
+    }
+
+    /// Route actions while the filter box is active: keys edit the filter
+    /// text, Esc clears it, and everything else is swallowed. Returns the
+    /// next action to propagate (only `Quit` passes through).
+    fn handle_filter_action(&mut self, action: &Action) -> Option<Action> {
+        match action {
+            Action::FilterInput(c) => {
+                self.filter_text.push(*c);
+                None
+            }
+            Action::FilterBackspace => {
+                self.filter_text.pop();
+                None
+            }
+            Action::ClearFilter => {
+                self.filter_mode = false;
+                self.filter_text.clear();
+                None
+            }
+            // Toggling or refreshing exits filter mode without a text change.
+            Action::ToggleFilter | Action::Refresh => {
+                self.filter_mode = false;
+                None
+            }
+            Action::Quit => Some(Action::Quit),
+            _ => None,
+        }
+    }
+
+    /// Move the selection of the focused panel by `delta` positions, clamped
+    /// to the panel bounds.
+    fn move_selection(&mut self, delta: isize) {
+        match self.focus {
+            PanelFocus::HostList => {
+                if let Some(i) = self.host_state.selected() {
+                    let max = self.total_host_list_len().saturating_sub(1);
+                    self.host_state
+                        .select(Some(i.saturating_add_signed(delta).min(max)));
+                }
+            }
+            PanelFocus::LogList => {
+                if let Some(i) = self.log_state.selected() {
+                    self.log_state.select(Some(
+                        i.saturating_add_signed(delta).min(self.log_list_max()),
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -516,31 +596,7 @@ impl Component for LogViewer {
 
     fn handle_action(&mut self, action: &Action) -> Result<Option<Action>, SentinelError> {
         if self.filter_mode {
-            return match action {
-                Action::ClearFilter => {
-                    self.filter_mode = false;
-                    self.filter_text.clear();
-                    Ok(None)
-                }
-                Action::ToggleFilter => {
-                    self.filter_mode = false;
-                    Ok(None)
-                }
-                Action::Quit => Ok(Some(Action::Quit)),
-                Action::Refresh => {
-                    self.filter_mode = false;
-                    Ok(None)
-                }
-                Action::FilterInput(c) => {
-                    self.filter_text.push(*c);
-                    Ok(None)
-                }
-                Action::FilterBackspace => {
-                    self.filter_text.pop();
-                    Ok(None)
-                }
-                _ => Ok(None),
-            };
+            return Ok(self.handle_filter_action(action));
         }
 
         match action {
@@ -553,53 +609,24 @@ impl Component for LogViewer {
                 Ok(None)
             }
             Action::SelectUp => {
-                match self.focus {
-                    PanelFocus::HostList => {
-                        if let Some(i) = self.host_state.selected() {
-                            self.host_state.select(Some(i.saturating_sub(1)));
-                        }
-                    }
-                    PanelFocus::LogList => {
-                        if let Some(i) = self.log_state.selected() {
-                            self.log_state.select(Some(i.saturating_sub(1)));
-                        }
-                    }
-                }
+                self.move_selection(-1);
                 Ok(None)
             }
             Action::SelectDown => {
-                match self.focus {
-                    PanelFocus::HostList => {
-                        if let Some(i) = self.host_state.selected() {
-                            let max = self.total_host_list_len().saturating_sub(1);
-                            self.host_state.select(Some((i + 1).min(max)));
-                        }
-                    }
-                    PanelFocus::LogList => {
-                        if let Some(i) = self.log_state.selected() {
-                            let max = self
-                                .selected_host
-                                .as_ref()
-                                .and_then(|h| self.log_entries.get(h).map(|v| v.len().saturating_sub(1)))
-                                .unwrap_or(0);
-                            self.log_state.select(Some((i + 1).min(max)));
-                        }
-                    }
-                }
+                self.move_selection(1);
                 Ok(None)
             }
             Action::Refresh => {
-                if let Some(selected) = self.host_state.selected() {
-                    if let Some((name, selection_type)) = self.resolve_selection(selected) {
-                        if self.selected_host.as_ref() != Some(&name) {
-                            self.selected_host = Some(name.clone());
-                            self.selection_type = selection_type;
-                            self.log_state.select(Some(0));
-                            let _ = tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(self.load_recent_entries(&name))
-                            });
-                        }
-                    }
+                if let Some(selected) = self.host_state.selected()
+                    && let Some((name, selection_type)) = self.resolve_selection(selected)
+                    && self.selected_host.as_ref() != Some(&name)
+                {
+                    self.selected_host = Some(name.clone());
+                    self.selection_type = selection_type;
+                    self.log_state.select(Some(0));
+                    let _ = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(self.load_recent_entries(&name))
+                    });
                 }
                 Ok(None)
             }
@@ -619,12 +646,8 @@ impl Component for LogViewer {
             }
             Action::PageDown => {
                 if let Some(i) = self.log_state.selected() {
-                    let max = self
-                        .selected_host
-                        .as_ref()
-                        .and_then(|h| self.log_entries.get(h).map(|v| v.len().saturating_sub(1)))
-                        .unwrap_or(0);
-                    self.log_state.select(Some((i + 20).min(max)));
+                    self.log_state
+                        .select(Some((i + 20).min(self.log_list_max())));
                 }
                 Ok(None)
             }
@@ -633,12 +656,14 @@ impl Component for LogViewer {
                 Ok(None)
             }
             Action::ScrollToBottom => {
-                if let Some(max) = self
+                // `log_list_max` reports 0 for an empty list, matching the
+                // previous behaviour of selecting index 0 in that case.
+                if self
                     .selected_host
                     .as_ref()
-                    .and_then(|h| self.log_entries.get(h).map(|v| v.len().saturating_sub(1)))
+                    .is_some_and(|h| self.log_entries.contains_key(h))
                 {
-                    self.log_state.select(Some(max));
+                    self.log_state.select(Some(self.log_list_max()));
                 }
                 Ok(None)
             }
@@ -647,7 +672,8 @@ impl Component for LogViewer {
                     let st = self.selection_type;
                     let name = selected.clone();
                     let _ = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(self.check_new_entries(&name, st))
+                        tokio::runtime::Handle::current()
+                            .block_on(self.check_new_entries(&name, st))
                     });
                 }
                 Ok(None)

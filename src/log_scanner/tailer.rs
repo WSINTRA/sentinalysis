@@ -420,7 +420,7 @@ mod tests {
 
     fn create_test_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(file, "{}", content).unwrap();
+        writeln!(file, "{content}").unwrap();
         file.flush().unwrap();
         file
     }
@@ -465,7 +465,7 @@ mod tests {
 
         let mut lines = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         lines.push(line.line);
@@ -475,7 +475,7 @@ mod tests {
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
         }
 
         tailer.stop();
@@ -513,16 +513,15 @@ mod tests {
 
         let mut new_lines = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
-                    if let Ok(line) = event {
-                        if line.line == "new line" {
+                    if let Ok(line) = event
+                        && line.line == "new line" {
                             new_lines.push(line.line);
                         }
-                    }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {},
         }
 
         tailer.stop();
@@ -542,17 +541,17 @@ mod tests {
 
         let mut offsets = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         offsets.push(line.byte_offset);
                     }
-                    if offsets.len() >= 1 {
+                    if !offsets.is_empty() {
                         break;
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
         }
 
         tailer.stop();
@@ -570,7 +569,7 @@ mod tests {
 
         let mut file_paths = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         file_paths.push(line.file_path.clone());
@@ -580,7 +579,7 @@ mod tests {
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
         }
 
         tailer.stop();
@@ -617,7 +616,7 @@ mod tests {
 
         let mut lines = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         lines.push(line.line);
@@ -627,7 +626,7 @@ mod tests {
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
         }
 
         tailer.stop();
@@ -730,7 +729,7 @@ mod tests {
 
         let mut lines = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         lines.push(line.line);
@@ -740,7 +739,7 @@ mod tests {
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
         }
 
         tailer.stop();
@@ -766,29 +765,22 @@ mod tests {
 
         let mut lines = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         lines.push((line.file_path.clone(), line.line));
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {},
         }
 
         tailer.stop();
 
         let found = lines.iter().any(|(path, line)| {
-            path.file_name()
-                .map(|n| n == "new-service.log")
-                .unwrap_or(false)
-                && line == "new service line"
+            path.file_name().is_some_and(|n| n == "new-service.log") && line == "new service line"
         });
-        assert!(
-            found,
-            "Expected to auto-tail new log file, got: {:?}",
-            lines
-        );
+        assert!(found, "Expected to auto-tail new log file, got: {lines:?}");
     }
 
     #[tokio::test]
@@ -815,22 +807,21 @@ mod tests {
 
         let mut lines = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         lines.push(line.line);
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {},
         }
 
         tailer.stop();
 
         assert!(
             lines.iter().any(|l| l == "after rotation"),
-            "Expected to tail new file after rotation, got: {:?}",
-            lines
+            "Expected to tail new file after rotation, got: {lines:?}"
         );
     }
 
@@ -852,21 +843,20 @@ mod tests {
 
         let mut lines = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         lines.push(line.line);
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
         }
 
         tailer.stop();
         assert!(
             lines.is_empty() || !lines.iter().any(|l| l == "should not be tailed"),
-            "Rotated file should not be tailed, got: {:?}",
-            lines
+            "Rotated file should not be tailed, got: {lines:?}"
         );
     }
 
@@ -887,7 +877,7 @@ mod tests {
 
         let mut lines = Vec::new();
         tokio::select! {
-            _ = async {
+            () = async {
                 while let Some(event) = rx.recv().await {
                     if let Ok(line) = event {
                         lines.push(line.line);
@@ -897,7 +887,7 @@ mod tests {
                     }
                 }
             } => {},
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
+            () = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {},
         }
 
         tailer.stop();

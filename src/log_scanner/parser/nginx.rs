@@ -34,9 +34,9 @@ impl LogParser for NginxAccessParser {
 
         let caps = NGINX_COMBINED_RE
             .captures(line)
-            .ok_or(ParseError::InvalidFormat(
-                format!("{line} - line does not match nginx combined format"),
-            ))?;
+            .ok_or(ParseError::InvalidFormat(format!(
+                "{line} - line does not match nginx combined format"
+            )))?;
 
         let remote_addr = caps
             .name("remote_addr")
@@ -91,7 +91,21 @@ impl LogParser for NginxAccessParser {
         let response_time_ms = caps
             .name("request_time")
             .and_then(|m| m.as_str().parse::<f64>().ok())
-            .map(|rt| (rt * 1000.0).round() as u64);
+            .map(|rt| {
+                // $request_time is a non-negative decimal per the log format;
+                // clamp absurd values instead of panicking on the cast.
+                let ms = (rt * 1000.0).round();
+                // 2^64 is exactly representable in f64; larger values
+                // saturate to u64::MAX instead of wrapping.
+                if ms >= 0.0 && ms < 2f64.powi(64) {
+                    // Range-checked above, so the cast cannot lose data.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let ms = ms as u64;
+                    ms
+                } else {
+                    u64::MAX
+                }
+            });
 
         let metadata = LogMetadata {
             client_ip: Some(remote_addr),
@@ -285,8 +299,7 @@ mod tests {
     fn test_parse_various_http_methods(#[case] method: &str) {
         let parser = NginxAccessParser::new();
         let line = format!(
-            r#"10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] "{} /test HTTP/1.1" 200 10 "-" "test" "app.example.com" 0.001"#,
-            method
+            r#"10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] "{method} /test HTTP/1.1" 200 10 "-" "test" "app.example.com" 0.001"#
         );
         let entry = parser.parse(&line).unwrap().unwrap();
         assert_eq!(entry.metadata.request_method, Some(method.to_string()));
@@ -297,7 +310,7 @@ mod tests {
         let parser = NginxAccessParser::new();
         let line = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /file HTTP/1.1\" 200 999999999 \"-\" \"test\" \"app.example.com\" 2.500";
         let entry = parser.parse(line).unwrap().unwrap();
-        assert_eq!(entry.metadata.bytes_sent, Some(999999999));
+        assert_eq!(entry.metadata.bytes_sent, Some(999_999_999));
     }
 
     #[test]

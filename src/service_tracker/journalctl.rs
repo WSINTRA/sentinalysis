@@ -91,10 +91,7 @@ impl JournalctlTailer {
             let () = engine_handle.thread().unpark();
         });
 
-        info!(
-            "journalctl tailer started for {} services",
-            services.len()
-        );
+        info!("journalctl tailer started for {} services", services.len());
         Ok(rx)
     }
 }
@@ -119,15 +116,10 @@ async fn consume_subscription(
     tx: Sender<JournalLine>,
     cancel: CancellationToken,
 ) -> Result<(), SentinelError> {
-    info!(
-        "journal tailing started for '{}'",
-        normalize_unit(service)
-    );
+    info!("journal tailing started for '{}'", normalize_unit(service));
 
-    let (bridge_tx, bridge_rx): (
-        CrossbeamSender<JournalLine>,
-        CrossbeamReceiver<JournalLine>,
-    ) = bounded(256);
+    let (bridge_tx, bridge_rx): (CrossbeamSender<JournalLine>, CrossbeamReceiver<JournalLine>) =
+        bounded(256);
 
     let service_name = service.to_string();
     let read_handle = thread::spawn(move || {

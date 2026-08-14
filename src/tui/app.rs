@@ -42,7 +42,9 @@ impl App {
         let (entry_tx, _entry_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let composite = Composite::new(vec![
-            Box::new(crate::tui::components::log_viewer::LogViewer::new(pool, entry_tx)),
+            Box::new(crate::tui::components::log_viewer::LogViewer::new(
+                pool, entry_tx,
+            )),
             Box::new(crate::tui::components::status_bar::StatusBar::new()),
         ]);
 

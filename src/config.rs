@@ -244,7 +244,7 @@ journalctl:
 
     #[test]
     fn test_service_override_config() {
-        let yaml = r#"
+        let yaml = r"
 log_watching:
   directories: []
   files: []
@@ -261,7 +261,7 @@ service_tracker:
 journalctl:
   enabled: false
   services: []
-"#;
+";
 
         let mut file = NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut file, yaml.as_bytes()).unwrap();
