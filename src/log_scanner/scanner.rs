@@ -113,7 +113,12 @@ impl Scanner {
     ) -> Result<(), SentinelError> {
         let parsed = parser
             .parse(&line.line)
-            .map_err(|e| SentinelError::ParseError(format!("{}: {}", parser.name(), e)))?;
+            .map_err(|e| SentinelError::ParseError(format!(
+                "{} [{}]: {}",
+                parser.name(),
+                line.file_path.display(),
+                e
+            )))?;
 
         let Some(entry) = parsed else {
             return Ok(());

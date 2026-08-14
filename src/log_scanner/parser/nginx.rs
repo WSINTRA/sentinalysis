@@ -35,7 +35,7 @@ impl LogParser for NginxAccessParser {
         let caps = NGINX_COMBINED_RE
             .captures(line)
             .ok_or(ParseError::InvalidFormat(
-                "{line} - line does not match nginx combined format".to_string(),
+                format!("{line} - line does not match nginx combined format"),
             ))?;
 
         let remote_addr = caps
