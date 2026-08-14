@@ -21,9 +21,9 @@ use crate::log_scanner::pipeline::{BoxFuture, Pipeline};
 use crate::log_scanner::tailer::TailEvent;
 
 /// Flush a batch after this many entries.
-const BATCH_SIZE: usize = 100;
+pub const BATCH_SIZE: usize = 100;
 /// ...or on this timer, whichever comes first.
-const BATCH_INTERVAL: Duration = Duration::from_secs(1);
+pub const BATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Persists a batch of log entries.
 pub trait LogSink: Send + Sync {
@@ -80,9 +80,27 @@ impl Scanner {
         batch_size: usize,
         batch_interval: Option<Duration>,
     ) -> Self {
+        Self::with_cancel(
+            pipeline,
+            batch_size,
+            batch_interval,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Like [`Self::with_batching`], but the scanner stops when the
+    /// provided external token is cancelled (e.g. the daemon's shutdown
+    /// signal), still performing the final flush.
+    #[must_use]
+    pub fn with_cancel(
+        pipeline: Arc<Pipeline>,
+        batch_size: usize,
+        batch_interval: Option<Duration>,
+        cancel_token: CancellationToken,
+    ) -> Self {
         Self {
             pipeline,
-            cancel_token: CancellationToken::new(),
+            cancel_token,
             batch_size,
             batch_interval,
         }

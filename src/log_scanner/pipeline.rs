@@ -201,6 +201,22 @@ impl ParserRegistry {
     }
 }
 
+/// Production pipeline wiring: the default parser registry, a noise
+/// filter built from `noise`, and DB-backed service resolution with
+/// caching.
+#[must_use]
+pub fn build_pipeline(
+    pool: sqlx::PgPool,
+    noise: &crate::config::NoiseFilterConfig,
+) -> Arc<Pipeline> {
+    Arc::new(Pipeline::new(
+        ParserRegistry::default_registry(),
+        Arc::new(NoiseFilter::from_config(noise)),
+        Arc::new(Classifier::new()),
+        Arc::new(DbServiceResolver::new(ServiceRepository::new(pool))),
+    ))
+}
+
 /// Turns `TailLine`s into `InsertLogEntry` records.
 pub struct Pipeline {
     parsers: ParserRegistry,
@@ -494,6 +510,24 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// `build_pipeline` must produce a working pipeline even when the
+    /// database is unreachable: the entry is still stored, just without a
+    /// service link.
+    #[tokio::test]
+    async fn test_build_pipeline_works_without_live_db() {
+        let pool = sqlx::PgPool::connect_lazy("postgresql://invalid:5432/none")
+            .expect("lazy pool does not connect");
+        let p = build_pipeline(pool, &crate::config::NoiseFilterConfig::default());
+        let line = tail_line(
+            "app.example.com-access.log",
+            "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET / HTTP/1.1\" 200 15 \"-\" \"curl/8.0\" \"app.example.com\" 0.1",
+        );
+
+        let entry = p.process_line(&line).await.unwrap().unwrap();
+        assert_eq!(entry.level, "info");
+        assert!(entry.service_id.is_none(), "no service link without a DB");
     }
 
     #[test]

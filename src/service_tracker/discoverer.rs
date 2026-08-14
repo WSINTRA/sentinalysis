@@ -1,3 +1,4 @@
+//! Discover systemd unit files in the configured search paths.
 use std::path::{Path, PathBuf};
 
 use crate::error::SentinelError;

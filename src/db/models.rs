@@ -1,3 +1,9 @@
+//! Row models mirroring the Postgres schema.
+//!
+//! `*` structs with `FromRow` are read models; `Insert*` structs are the
+//! write side. `SystemMetric`, `ActiveSession`, `Alert`, and `ApiKey`
+//! mirror tables that exist in the schema but no code path uses yet.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;

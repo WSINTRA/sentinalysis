@@ -1,10 +1,19 @@
+//! User configuration (YAML file, optional) and its defaults.
+//!
+//! Each section owns its own `Default` impl; `Config::default()` — and
+//! therefore a missing config file — is exactly the sum of those
+//! per-section defaults.
+
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
 use crate::error::SentinelError;
 
+/// `#[serde(default)]` makes partial config files valid: any omitted
+/// section falls back to its own defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct Config {
     pub log_watching: LogWatchingConfig,
     pub noise_filter: NoiseFilterConfig,
@@ -211,7 +220,8 @@ journalctl:
 
     #[test]
     fn test_load_invalid_yaml() {
-        let yaml = "invalid: yaml: content:";
+        // Genuinely malformed YAML (an unclosed flow sequence).
+        let yaml = "log_watching: [unclosed";
 
         let mut file = NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut file, yaml.as_bytes()).unwrap();
@@ -224,6 +234,21 @@ journalctl:
             }
             _ => panic!("Expected ConfigError"),
         }
+    }
+
+    /// Unknown keys are ignored and omitted sections keep their defaults,
+    /// so a config file only needs to spell out what it overrides.
+    #[test]
+    fn test_load_partial_config_fills_defaults() {
+        let yaml = "journalctl:\n  enabled: true\n  services: []\n";
+
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, yaml.as_bytes()).unwrap();
+
+        let config = Config::load(file.path().to_str().unwrap()).unwrap();
+        assert!(config.journalctl.enabled);
+        assert_eq!(config.log_watching, LogWatchingConfig::default());
+        assert_eq!(config.noise_filter, NoiseFilterConfig::default());
     }
 
     #[test]

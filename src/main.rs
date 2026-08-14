@@ -1,19 +1,15 @@
+//! Sentinel CLI: parses flags and starts either the TUI or the daemon.
+
 use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
 use tracing::{error, info};
 
+use sentinel::daemon::{ensure_daemon_running, run_daemon};
 use sentinel::db::pool::create_pool;
 use sentinel::error::SentinelError;
-
-mod setup;
-use setup::init_tracing;
-use setup::load_config;
-
-mod daemon;
-use daemon::ensure_daemon_running;
-use daemon::run_daemon;
+use sentinel::setup::{init_tracing, load_config};
 
 #[derive(Parser, Debug)]
 #[command(name = "sentinel", about = "Log monitoring and security analysis tool")]

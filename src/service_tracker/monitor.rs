@@ -1,3 +1,4 @@
+//! Poll systemd unit status via `systemctl show`.
 use std::process::Command;
 
 use crate::error::SentinelError;

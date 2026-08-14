@@ -1,3 +1,4 @@
+//! Tail systemd journal output for the configured services.
 use std::thread;
 
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender, bounded};

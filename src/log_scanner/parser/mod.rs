@@ -1,3 +1,9 @@
+//! Pluggable log-line parsers and the parsed-entry model they produce.
+//!
+//! A [`LogParser`] turns one raw line into a `Option<ParsedLogEntry>`
+//! (`None` = the line does not belong to this format). Implementations:
+//! nginx access logs ([`nginx`]) and syslog-style auth logs ([`auth`]).
+
 use chrono::{DateTime, Utc};
 use std::net::IpAddr;
 
