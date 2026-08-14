@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::error::SentinelError;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Config {
     pub log_watching: LogWatchingConfig,
     pub noise_filter: NoiseFilterConfig,
@@ -12,19 +12,33 @@ pub struct Config {
     pub journalctl: JournalctlConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogWatchingConfig {
     pub directories: Vec<LogDirectoryConfig>,
     pub files: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Default watch targets: every nginx vhost access log plus the system
+/// auth log. The single source of truth for `Config::default()`.
+impl Default for LogWatchingConfig {
+    fn default() -> Self {
+        Self {
+            directories: vec![LogDirectoryConfig {
+                path: PathBuf::from("/var/log/nginx"),
+                pattern: "*.log".to_string(),
+            }],
+            files: vec![PathBuf::from("/var/log/auth.log")],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogDirectoryConfig {
     pub path: PathBuf,
     pub pattern: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NoiseFilterConfig {
     pub excluded_ips: Vec<IpAddr>,
@@ -63,7 +77,7 @@ impl Default for NoiseFilterConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServiceTrackerConfig {
     pub enabled: bool,
@@ -86,68 +100,26 @@ impl Default for ServiceTrackerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceOverrideConfig {
     pub name: String,
     pub log_paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct JournalctlConfig {
     pub enabled: bool,
     pub services: Vec<String>,
 }
 
 impl Config {
+    /// The built-in defaults used when no config file is present.
+    ///
+    /// Delegates to each section's own `Default` impl so the defaults live
+    /// in exactly one place per section.
     #[must_use]
     pub fn default_config() -> Self {
-        Self {
-            log_watching: LogWatchingConfig {
-                directories: vec![LogDirectoryConfig {
-                    path: PathBuf::from("/var/log/nginx"),
-                    pattern: "*.log".to_string(),
-                }],
-                files: vec![PathBuf::from("/var/log/auth.log")],
-            },
-            noise_filter: NoiseFilterConfig {
-                excluded_ips: vec![IpAddr::from([127, 0, 0, 1])],
-                health_check_paths: vec!["/health".to_string(), "/healthz".to_string()],
-                static_asset_extensions: vec![
-                    "css".to_string(),
-                    "js".to_string(),
-                    "png".to_string(),
-                    "jpg".to_string(),
-                    "jpeg".to_string(),
-                    "gif".to_string(),
-                    "ico".to_string(),
-                    "svg".to_string(),
-                    "woff".to_string(),
-                    "woff2".to_string(),
-                    "ttf".to_string(),
-                    "eot".to_string(),
-                ],
-                known_bot_user_agents: vec![
-                    "Googlebot".to_string(),
-                    "Bingbot".to_string(),
-                    "YandexBot".to_string(),
-                    "Slurp".to_string(),
-                    "DuckDuckBot".to_string(),
-                ],
-            },
-            service_tracker: ServiceTrackerConfig {
-                enabled: true,
-                discovery_paths: vec![
-                    "/etc/systemd/system".to_string(),
-                    "/usr/lib/systemd/system".to_string(),
-                ],
-                poll_interval_seconds: 30,
-                services: vec![],
-            },
-            journalctl: JournalctlConfig {
-                enabled: false,
-                services: vec![],
-            },
-        }
+        Self::default()
     }
 
     pub fn load(path: &str) -> Result<Self, SentinelError> {
@@ -172,6 +144,18 @@ mod tests {
         assert!(!config.log_watching.directories.is_empty());
         assert!(config.service_tracker.enabled);
         assert!(!config.journalctl.enabled);
+    }
+
+    /// `default_config` must agree with the per-section `Default` impls —
+    /// the sections are the single source of truth for the defaults.
+    #[test]
+    fn test_default_config_matches_section_defaults() {
+        let config = Config::default_config();
+        assert_eq!(config, Config::default());
+        assert_eq!(config.log_watching, LogWatchingConfig::default());
+        assert_eq!(config.noise_filter, NoiseFilterConfig::default());
+        assert_eq!(config.service_tracker, ServiceTrackerConfig::default());
+        assert_eq!(config.journalctl, JournalctlConfig::default());
     }
 
     #[test]

@@ -1,77 +1,136 @@
+//! Noise filtering for parsed log entries.
+//!
+//! `NoiseFilter` decides what to do with a `ParsedLogEntry` before it is
+//! stored: keep it, exclude it entirely, aggregate it (noise such as bots
+//! or static assets), or flag it as a security event. The detection rules
+//! come from `NoiseFilterConfig`; security *categorisation* (which kind of
+//! attack) belongs to the `Classifier`, and this filter defers to it for
+//! `SQLi` / path-traversal detection.
+
+use crate::config::NoiseFilterConfig;
+use crate::log_scanner::classifier::Classifier;
 use crate::log_scanner::parser::ParsedLogEntry;
 use regex::Regex;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+/// Evaluates parsed log entries against a set of noise rules.
+///
+/// Check order matters: earlier rules win, so cheap, unambiguous noise
+/// (excluded IPs) is tested before expensive or overlapping ones.
 #[derive(Debug, Clone)]
 pub struct NoiseFilter {
     excluded_ips: Vec<IpAddr>,
-    static_asset_patterns: Arc<Regex>,
+    health_check_paths: Vec<String>,
+    static_asset_pattern: Arc<Regex>,
     bot_user_agents: Vec<Arc<Regex>>,
     scanner_paths: Arc<Regex>,
+    /// Shared classifier used to detect `SQLi` / path traversal in requests.
+    classifier: Arc<Classifier>,
 }
 
 impl NoiseFilter {
+    /// A filter built from the default `NoiseFilterConfig`.
     #[must_use]
     pub fn new() -> Self {
+        Self::from_config(&NoiseFilterConfig::default())
+    }
+
+    /// Build a filter from user configuration. Extension and user-agent
+    /// strings are escaped, so they are treated as literals, not patterns.
+    #[must_use]
+    pub fn from_config(config: &NoiseFilterConfig) -> Self {
+        let static_asset_pattern = if config.static_asset_extensions.is_empty() {
+            // Nothing to match.
+            Arc::new(Regex::new(r"$^").expect("unmatchable regex is valid"))
+        } else {
+            let extensions = config
+                .static_asset_extensions
+                .iter()
+                .map(|ext| {
+                    let escaped = regex::escape(ext);
+                    if ext.contains('.') {
+                        // Multi-dot "extensions" (e.g. "manifest.json") are
+                        // matched literally at the end of the path.
+                        escaped
+                    } else {
+                        // A plain extension must be preceded by a dot so that
+                        // "css" matches ".css" but not "bcss".
+                        format!(r"\.{escaped}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            Arc::new(
+                Regex::new(&format!("(?:{extensions})$"))
+                    .expect("escaped extensions always form a valid regex"),
+            )
+        };
+
+        let bot_user_agents = config
+            .known_bot_user_agents
+            .iter()
+            .map(|ua| {
+                Arc::new(
+                    Regex::new(&regex::escape(ua))
+                        .expect("escaped user agent string is a valid regex"),
+                )
+            })
+            .collect();
+
         Self {
-            excluded_ips: vec![IpAddr::from([127, 0, 0, 1])],
-            static_asset_patterns: Arc::new(
-                Regex::new(r"\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$")
-                    .expect("hardcoded static asset regex must be valid"),
-            ),
-            bot_user_agents: vec![
-                Arc::new(
-                    Regex::new(r"Googlebot").expect("hardcoded Googlebot regex must be valid"),
-                ),
-                Arc::new(Regex::new(r"Bingbot").expect("hardcoded Bingbot regex must be valid")),
-                Arc::new(
-                    Regex::new(r"YandexBot").expect("hardcoded YandexBot regex must be valid"),
-                ),
-                Arc::new(Regex::new(r"Slurp").expect("hardcoded Slurp regex must be valid")),
-                Arc::new(
-                    Regex::new(r"DuckDuckBot").expect("hardcoded DuckDuckBot regex must be valid"),
-                ),
-            ],
+            excluded_ips: config.excluded_ips.clone(),
+            health_check_paths: config.health_check_paths.clone(),
+            static_asset_pattern,
+            bot_user_agents,
+            // Reconnaissance endpoints are a fixed, well-known set.
             scanner_paths: Arc::new(
                 Regex::new(
                     r"(/wp-admin|/wp-login|/phpmyadmin|/\.env|/\.git|/admin\.php|/xmlrpc\.php)",
                 )
                 .expect("hardcoded scanner paths regex must be valid"),
             ),
+            classifier: Arc::new(Classifier::new()),
         }
     }
 
+    /// Replace the excluded IP list (builder style, mostly for tests).
     #[must_use]
     pub fn with_excluded_ips(mut self, ips: Vec<IpAddr>) -> Self {
         self.excluded_ips = ips;
         self
     }
 
+    /// Evaluate an entry against the noise rules.
     #[must_use]
     pub fn evaluate(&self, entry: &ParsedLogEntry) -> FilterResult {
-        // Check excluded IPs first
+        // Health checkers and local monitoring are the most common noise.
         if let Some(ip) = &entry.metadata.client_ip
             && self.excluded_ips.contains(ip)
         {
             return FilterResult::Exclude("excluded IP".to_string());
         }
 
-        // Check for scanner/reconnaissance paths
+        if let Some(path) = &entry.metadata.request_path
+            && self.health_check_paths.iter().any(|p| p == path)
+        {
+            return FilterResult::Aggregate("health check".to_string());
+        }
+
+        // Active reconnaissance against well-known endpoints is worth
+        // surfacing even though it is not "interesting" log content.
         if let Some(ref path) = entry.metadata.request_path
             && self.scanner_paths.is_match(path)
         {
             return FilterResult::FlagSecurity(format!("scanner path: {path}"));
         }
 
-        // Check for static assets
         if let Some(ref path) = entry.metadata.request_path
-            && self.static_asset_patterns.is_match(path)
+            && self.static_asset_pattern.is_match(path)
         {
             return FilterResult::Aggregate("static asset".to_string());
         }
 
-        // Check for known bots
         if let Some(ref ua) = entry.metadata.user_agent {
             for bot_pattern in &self.bot_user_agents {
                 if bot_pattern.is_match(ua) {
@@ -80,31 +139,20 @@ impl NoiseFilter {
             }
         }
 
-        // Check for security patterns in request
-        if let Some(ref path) = entry.metadata.request_path {
-            if Self::is_sql_injection(path) {
-                return FilterResult::FlagSecurity("SQL injection attempt".to_string());
-            }
-            if Self::is_path_traversal(path) {
-                return FilterResult::FlagSecurity("path traversal attempt".to_string());
-            }
+        // Attack detection is owned by the classifier; the filter only
+        // translates the result into a storage decision.
+        let threat = self.classifier.classify(entry);
+        if threat.categories.iter().any(|c| {
+            matches!(
+                c,
+                crate::log_scanner::classifier::ThreatCategory::SqlInjection
+                    | crate::log_scanner::classifier::ThreatCategory::PathTraversal
+            )
+        }) {
+            return FilterResult::FlagSecurity("attack pattern in request".to_string());
         }
 
         FilterResult::Keep
-    }
-
-    #[must_use]
-    fn is_sql_injection(path: &str) -> bool {
-        let path_lower = path.to_lowercase();
-        path_lower.contains("union select")
-            || path_lower.contains("' or '")
-            || path_lower.contains("1=1")
-            || path_lower.contains("drop table")
-    }
-
-    #[must_use]
-    fn is_path_traversal(path: &str) -> bool {
-        path.contains("../") || path.contains("..\\")
     }
 }
 
@@ -114,20 +162,27 @@ impl Default for NoiseFilter {
     }
 }
 
+/// The storage decision for a parsed entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilterResult {
+    /// Store the entry as-is.
     Keep,
+    /// Drop the entry entirely.
     Exclude(String),
+    /// Store as noise (raw line suppressed).
     Aggregate(String),
+    /// Store and mark as a security event.
     FlagSecurity(String),
 }
 
 impl FilterResult {
+    /// Whether the entry should be persisted at all.
     #[must_use]
     pub fn should_store(&self) -> bool {
         !matches!(self, FilterResult::Exclude(_))
     }
 
+    /// Whether the entry is flagged as a security event.
     #[must_use]
     pub fn is_security_flag(&self) -> bool {
         matches!(self, FilterResult::FlagSecurity(_))
@@ -137,7 +192,7 @@ impl FilterResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log_scanner::parser::{LogLevel, LogMetadata, ParsedLogEntry};
+    use crate::log_scanner::parser::{LogLevel, LogMetadata};
     use chrono::Utc;
     use rstest::rstest;
     use std::net::IpAddr;
@@ -287,10 +342,10 @@ mod tests {
             "curl/8.0",
             400,
         );
-        assert_eq!(
+        assert!(matches!(
             filter.evaluate(&entry),
-            FilterResult::FlagSecurity("SQL injection attempt".to_string())
-        );
+            FilterResult::FlagSecurity(_)
+        ));
     }
 
     #[rstest]
@@ -314,10 +369,10 @@ mod tests {
             "curl/8.0",
             403,
         );
-        assert_eq!(
+        assert!(matches!(
             filter.evaluate(&entry),
-            FilterResult::FlagSecurity("path traversal attempt".to_string())
-        );
+            FilterResult::FlagSecurity(_)
+        ));
     }
 
     #[test]
@@ -356,5 +411,100 @@ mod tests {
     fn test_flag_security_is_security_flag() {
         assert!(FilterResult::FlagSecurity("reason".to_string()).is_security_flag());
         assert!(!FilterResult::Keep.is_security_flag());
+    }
+
+    // --- from_config: user-supplied rules actually take effect ---
+
+    fn config_with(
+        mut health: Vec<String>,
+        mut extensions: Vec<String>,
+        mut bots: Vec<String>,
+    ) -> NoiseFilterConfig {
+        if health.is_empty() {
+            health = vec!["/health".to_string(), "/healthz".to_string()];
+        }
+        if extensions.is_empty() {
+            extensions = vec!["css".to_string()];
+        }
+        if bots.is_empty() {
+            bots = vec!["Googlebot".to_string()];
+        }
+        NoiseFilterConfig {
+            excluded_ips: vec![],
+            health_check_paths: health,
+            static_asset_extensions: extensions,
+            known_bot_user_agents: bots,
+        }
+    }
+
+    #[test]
+    fn test_from_config_health_check_path_aggregated() {
+        let filter =
+            NoiseFilter::from_config(&config_with(vec!["/ping".to_string()], vec![], vec![]));
+        let entry = make_entry(IpAddr::from([192, 168, 1, 1]), "/ping", "curl/8.0", 200);
+        assert_eq!(
+            filter.evaluate(&entry),
+            FilterResult::Aggregate("health check".to_string())
+        );
+    }
+
+    #[test]
+    fn test_from_config_health_check_path_is_exact_match() {
+        let filter =
+            NoiseFilter::from_config(&config_with(vec!["/ping".to_string()], vec![], vec![]));
+        let entry = make_entry(IpAddr::from([192, 168, 1, 1]), "/api/ping", "curl/8.0", 200);
+        assert_eq!(filter.evaluate(&entry), FilterResult::Keep);
+    }
+
+    #[test]
+    fn test_from_config_empty_static_extensions_matches_nothing() {
+        // A genuinely empty config (no defaulting helper in between).
+        let config = NoiseFilterConfig {
+            excluded_ips: vec![],
+            health_check_paths: vec![],
+            static_asset_extensions: vec![],
+            known_bot_user_agents: vec![],
+        };
+        let filter = NoiseFilter::from_config(&config);
+        let entry = make_entry(
+            IpAddr::from([192, 168, 1, 1]),
+            "/styles/main.css",
+            "Mozilla/5.0",
+            200,
+        );
+        assert_eq!(filter.evaluate(&entry), FilterResult::Keep);
+    }
+
+    #[test]
+    fn test_from_config_custom_bot_user_agent() {
+        let filter = NoiseFilter::from_config(&config_with(
+            vec![],
+            vec![],
+            vec!["MyCrawler/1.0".to_string()],
+        ));
+        let entry = make_entry(
+            IpAddr::from([192, 168, 1, 1]),
+            "/page",
+            "MyCrawler/1.0",
+            200,
+        );
+        assert_eq!(
+            filter.evaluate(&entry),
+            FilterResult::Aggregate("bot: MyCrawler/1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_from_config_excluded_ips() {
+        let config = NoiseFilterConfig {
+            excluded_ips: vec![IpAddr::from([10, 1, 1, 1])],
+            ..config_with(vec![], vec![], vec![])
+        };
+        let filter = NoiseFilter::from_config(&config);
+        let entry = make_entry(IpAddr::from([10, 1, 1, 1]), "/api/data", "curl/8.0", 200);
+        assert_eq!(
+            filter.evaluate(&entry),
+            FilterResult::Exclude("excluded IP".to_string())
+        );
     }
 }
