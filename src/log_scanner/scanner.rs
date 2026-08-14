@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,6 +93,14 @@ impl Scanner {
         Ok(())
     }
 
+    fn extract_vhost_from_file_path(file_path: &Path) -> Option<String> {
+        file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|name| name.ends_with("-access.log"))
+            .map(|name| name.trim_end_matches("-access.log").to_string())
+    }
+
     #[allow(clippy::cast_possible_wrap)]
     async fn process_line(
         &self,
@@ -119,7 +128,8 @@ impl Scanner {
             _ => None,
         };
 
-        let virtual_host = entry.metadata.virtual_host.clone();
+        let virtual_host = Self::extract_vhost_from_file_path(&line.file_path)
+            .or_else(|| entry.metadata.virtual_host.clone());
         let service_id = if let Some(vhost) = &virtual_host {
             let service = crate::db::models::InsertService {
                 name: vhost.clone(),
