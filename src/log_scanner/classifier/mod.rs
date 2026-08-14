@@ -1,6 +1,22 @@
-use crate::log_scanner::parser::ParsedLogEntry;
+//! Threat classification for parsed log entries.
+//!
+//! The `Classifier` inspects a `ParsedLogEntry` and produces a
+//! `ThreatResult`: an ordered threat level, the categories that matched
+//! (`SQLi`, XSS, path traversal, ...), and a confidence score.
+//!
+//! Detection is data-driven: every substring rule lives in
+//! [`patterns::PATTERN_RULES`], so extending detection means appending a
+//! row to that table, not writing a new check function. Two heuristics
+//! that need the entry's level or status code (not just its text) remain
+//! as small dedicated functions here.
+
+pub mod patterns;
+
 use std::fmt;
 
+use crate::log_scanner::parser::{LogLevel, LogMetadata, ParsedLogEntry};
+
+/// Severity of a threat, from harmless to worst case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum ThreatLevel {
     #[default]
@@ -23,6 +39,7 @@ impl fmt::Display for ThreatLevel {
     }
 }
 
+/// The kind of threat a log entry may indicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThreatCategory {
     SqlInjection,
@@ -52,6 +69,33 @@ impl fmt::Display for ThreatCategory {
     }
 }
 
+impl ThreatCategory {
+    /// Severity tier implied by this category on its own.
+    fn severity(self) -> ThreatLevel {
+        match self {
+            ThreatCategory::CommandInjection => ThreatLevel::Critical,
+            ThreatCategory::SqlInjection
+            | ThreatCategory::Xss
+            | ThreatCategory::PathTraversal
+            | ThreatCategory::Scanner => ThreatLevel::High,
+            ThreatCategory::BruteForce | ThreatCategory::SensitiveFile => ThreatLevel::Medium,
+            ThreatCategory::TlsError | ThreatCategory::SuspiciousPattern => ThreatLevel::Low,
+        }
+    }
+
+    /// Categories that strongly indicate an active attack; their presence
+    /// boosts the confidence score.
+    fn is_strong(self) -> bool {
+        matches!(
+            self,
+            ThreatCategory::CommandInjection
+                | ThreatCategory::SqlInjection
+                | ThreatCategory::Scanner
+        )
+    }
+}
+
+/// Outcome of classifying one log entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreatResult {
     pub threat_level: ThreatLevel,
@@ -75,6 +119,7 @@ impl fmt::Display for ThreatResult {
     }
 }
 
+/// Stateless threat classifier.
 #[derive(Debug, Clone, Default)]
 pub struct Classifier {
     _private: (),
@@ -86,6 +131,8 @@ impl Classifier {
         Self::default()
     }
 
+    /// Classify an entry: run every pattern rule, apply the two
+    /// level/status heuristics, then derive level and confidence.
     #[must_use]
     pub fn classify(&self, entry: &ParsedLogEntry) -> ThreatResult {
         let mut result = ThreatResult {
@@ -94,6 +141,7 @@ impl Classifier {
             confidence: 0.0,
         };
 
+        // All inputs are lowercased once; patterns are literal substrings.
         let text = format!("{} {}", entry.message, entry.raw).to_lowercase();
         let path = entry
             .metadata
@@ -101,317 +149,121 @@ impl Classifier {
             .as_ref()
             .map(|p| p.to_lowercase())
             .unwrap_or_default();
+        let user_agent = entry.metadata.user_agent.as_ref().map(|u| u.to_lowercase());
 
-        checks::check_command_injection(&mut result, &text, &path);
-        checks::check_sql_injection(&mut result, &text, &path);
-        checks::check_xss(&mut result, &text, &path);
-        checks::check_path_traversal(&mut result, &path);
-        checks::check_brute_force(&mut result, &text, entry);
-        checks::check_scanner_ua(&mut result, &entry.metadata);
-        checks::check_sensitive_files(&mut result, &path);
-        checks::check_tls_errors(&mut result, &text);
-        checks::check_error_responses(&mut result, &entry.metadata, &path);
+        for rule in patterns::PATTERN_RULES {
+            if rule.matches(&text, &path, user_agent.as_deref()) {
+                add_category(&mut result, rule.category);
+            }
+        }
+
+        check_brute_force_heuristic(&mut result, &text, entry);
+        check_error_responses(&mut result, &entry.metadata, &path);
 
         if result.categories.is_empty() {
             return result;
         }
 
-        result.confidence = checks::calculate_confidence(&result);
-        result.threat_level = checks::calculate_threat_level(&result);
+        result.confidence = calculate_confidence(&result);
+        result.threat_level = calculate_threat_level(&result);
         result
     }
 }
 
-mod checks {
-    use super::{ParsedLogEntry, ThreatCategory, ThreatLevel, ThreatResult};
-    use crate::log_scanner::parser::{LogLevel, LogMetadata};
-
-    fn add_category(result: &mut ThreatResult, category: ThreatCategory) {
-        if !result.categories.contains(&category) {
-            result.categories.push(category);
-        }
+/// Add a category if it has not already been matched.
+fn add_category(result: &mut ThreatResult, category: ThreatCategory) {
+    if !result.categories.contains(&category) {
+        result.categories.push(category);
     }
+}
 
-    pub fn check_command_injection(result: &mut ThreatResult, text: &str, path: &str) {
-        let patterns = [
-            ";cat ", ";ls ", ";whoami", ";id ", ";rm ", "|grep", "|cat ", "`whoami`", "`id`",
-            "$(wget", "$(curl", "$(cat ", ";wget ", ";curl ", ";nc ", ";bash ", ";sh ", ";python ",
-            ";perl ", ";ruby ", ";php ",
-        ];
-
-        for &pattern in &patterns {
-            if text.contains(pattern) || path.contains(pattern) {
-                add_category(result, ThreatCategory::CommandInjection);
-                return;
-            }
-        }
+/// An error-level log line mentioning passwords is treated as credential
+/// abuse even without a known brute-force phrase.
+fn check_brute_force_heuristic(result: &mut ThreatResult, text: &str, entry: &ParsedLogEntry) {
+    if entry.level == LogLevel::Error && text.contains("password") {
+        add_category(result, ThreatCategory::BruteForce);
     }
+}
 
-    pub fn check_sql_injection(result: &mut ThreatResult, text: &str, path: &str) {
-        let patterns = [
-            "' or '",
-            "' or 1",
-            " or 1=1",
-            " or '1'='1",
-            "union select",
-            "union all select",
-            "drop table",
-            "drop database",
-            "insert into",
-            "delete from",
-            "update .* set",
-            "exec xp_",
-            "exec sp_",
-            "';--",
-            "'--",
-            "admin'--",
-            "1; drop",
-            "1 and 1=1",
-            "1' and '1'='1",
-        ];
+/// 403/404 responses on admin-ish paths are classic reconnaissance.
+fn check_error_responses(result: &mut ThreatResult, metadata: &LogMetadata, path: &str) {
+    let Some(status) = metadata.status_code else {
+        return;
+    };
 
-        for &pattern in &patterns {
-            if text.contains(pattern) || path.contains(pattern) {
-                add_category(result, ThreatCategory::SqlInjection);
-                return;
-            }
-        }
-    }
-
-    pub fn check_xss(result: &mut ThreatResult, text: &str, path: &str) {
-        let patterns = [
-            "<script",
-            "javascript:",
-            "onerror=",
-            "onload=",
-            "onclick=",
-            "onmouseover=",
-            "<img src=",
-            "<svg ",
-            "<iframe",
-            "alert(",
-            "document.cookie",
-            "eval(",
-        ];
-
-        for &pattern in &patterns {
-            if text.contains(pattern) || path.contains(pattern) {
-                add_category(result, ThreatCategory::Xss);
-                return;
-            }
-        }
-    }
-
-    pub fn check_path_traversal(result: &mut ThreatResult, path: &str) {
-        let patterns = [
-            "../",
-            "..\\",
-            "..%2f",
-            "..%5c",
-            "%2e%2e/",
-            "....//",
-            "/etc/passwd",
-            "/etc/shadow",
-            "/proc/self",
-            "php://filter",
-            "php://input",
-            "file://",
-        ];
-
-        for &pattern in &patterns {
-            if path.contains(pattern) {
-                add_category(result, ThreatCategory::PathTraversal);
-                return;
-            }
-        }
-    }
-
-    pub fn check_brute_force(result: &mut ThreatResult, text: &str, entry: &ParsedLogEntry) {
-        let patterns = [
-            "failed password",
-            "authentication failure",
-            "invalid user",
-            "maximum authentication attempts",
-            "too many authentication failures",
-            "access denied",
-            "login failed",
-        ];
-
-        for &pattern in &patterns {
-            if text.contains(pattern) {
-                add_category(result, ThreatCategory::BruteForce);
-                return;
-            }
-        }
-
-        if entry.level == LogLevel::Error && text.contains("password") {
-            add_category(result, ThreatCategory::BruteForce);
-        }
-    }
-
-    pub fn check_scanner_ua(result: &mut ThreatResult, metadata: &LogMetadata) {
-        let Some(ref ua) = metadata.user_agent else {
-            return;
-        };
-
-        let ua_lower = ua.to_lowercase();
-        let scanners = [
-            "sqlmap",
-            "nikto",
-            "nmap",
-            "masscan",
-            "hydra",
-            "medusa",
-            "burp suite",
-            "dirbuster",
-            "gobuster",
-            "wpscan",
-            "nuclei",
-            "ffuf",
-            "feroxbuster",
-            "w3af",
-        ];
-
-        for &scanner in &scanners {
-            if ua_lower.contains(scanner) {
-                add_category(result, ThreatCategory::Scanner);
-                return;
-            }
-        }
-    }
-
-    pub fn check_sensitive_files(result: &mut ThreatResult, path: &str) {
-        let patterns = [
+    if status == 403 || status == 404 {
+        const SUSPICIOUS_PATHS: [&str; 8] = [
+            "/admin",
+            "/wp-admin",
+            "/phpmyadmin",
+            "/manager",
+            "/console",
+            "/config",
             "/.env",
-            "/.git",
-            "/.htaccess",
-            "/.htpasswd",
-            "/wp-config.php",
-            "/config/database.yml",
-            "/config/database.yaml",
-            "/config/secrets.yml",
-            "/.aws/credentials",
-            "/.ssh/id_rsa",
-            "/proc/self/environ",
-            "/boot.ini",
-            "/web.config",
-            "/phpinfo.php",
-            "/server-status",
-            "/.svn",
-            "/.DS_Store",
+            "/backup",
         ];
 
-        for &pattern in &patterns {
-            if path == pattern || path.starts_with(pattern) {
-                add_category(result, ThreatCategory::SensitiveFile);
-                return;
-            }
-        }
-    }
-
-    pub fn check_tls_errors(result: &mut ThreatResult, text: &str) {
-        let patterns = [
-            "ssl_do_handshake",
-            "ssl_error",
-            "certificate verify failed",
-            "tls alert",
-            "handshake failure",
-        ];
-
-        for &pattern in &patterns {
-            if text.contains(pattern) {
-                add_category(result, ThreatCategory::TlsError);
-                return;
-            }
-        }
-    }
-
-    pub fn check_error_responses(result: &mut ThreatResult, metadata: &LogMetadata, path: &str) {
-        let Some(status) = metadata.status_code else {
-            return;
-        };
-
-        if status == 403 || status == 404 {
-            let suspicious_paths = [
-                "/admin",
-                "/wp-admin",
-                "/phpmyadmin",
-                "/manager",
-                "/console",
-                "/config",
-                "/.env",
-                "/backup",
-            ];
-
-            for &sp in &suspicious_paths {
-                if path.contains(sp) {
-                    add_category(result, ThreatCategory::SuspiciousPattern);
-                    return;
-                }
-            }
-        }
-    }
-
-    pub fn calculate_threat_level(result: &ThreatResult) -> ThreatLevel {
-        let has_critical = result
-            .categories
-            .contains(&ThreatCategory::CommandInjection);
-        let has_high = result.categories.iter().any(|c| {
-            matches!(
-                c,
-                ThreatCategory::SqlInjection
-                    | ThreatCategory::Xss
-                    | ThreatCategory::PathTraversal
-                    | ThreatCategory::Scanner
-            )
-        });
-        let has_medium = result.categories.iter().any(|c| {
-            matches!(
-                c,
-                ThreatCategory::BruteForce | ThreatCategory::SensitiveFile
-            )
-        });
-
-        let category_count = result.categories.len();
-
-        if has_critical || (has_high && category_count >= 2) {
-            ThreatLevel::Critical
-        } else if has_high {
-            ThreatLevel::High
-        } else if has_medium || category_count >= 2 {
-            ThreatLevel::Medium
-        } else if !result.categories.is_empty() {
-            ThreatLevel::Low
-        } else {
-            ThreatLevel::None
-        }
-    }
-
-    pub fn calculate_confidence(result: &ThreatResult) -> f64 {
-        let base = match result.categories.len() {
-            1 => 0.7_f64,
-            2 => 0.85_f64,
-            3..=4 => 0.95_f64,
-            _ => 1.0_f64,
-        };
-
-        let has_strong = result.categories.iter().any(|c| {
-            matches!(
-                c,
-                ThreatCategory::CommandInjection
-                    | ThreatCategory::SqlInjection
-                    | ThreatCategory::Scanner
-            )
-        });
-
-        if has_strong {
-            (base + 0.1_f64).min(1.0_f64)
-        } else {
-            base
+        if SUSPICIOUS_PATHS.iter().any(|sp| path.contains(sp)) {
+            add_category(result, ThreatCategory::SuspiciousPattern);
         }
     }
 }
 
+/// Derive the overall level from the matched categories:
+/// - `CommandInjection` alone is critical
+/// - any High-tier category (plus a second category) is critical
+/// - otherwise the highest tier present wins, with two or more
+///   categories bumping to at least Medium
+fn calculate_threat_level(result: &ThreatResult) -> ThreatLevel {
+    let severities: Vec<ThreatLevel> = result
+        .categories
+        .iter()
+        .copied()
+        .map(ThreatCategory::severity)
+        .collect();
+    let has_critical = severities.contains(&ThreatLevel::Critical);
+    let has_high = severities.iter().any(|l| *l >= ThreatLevel::High);
+    // Only reached when nothing High/Critical matched, so ">= Medium"
+    // here is exactly the Medium tier.
+    let has_medium = severities.iter().any(|l| *l >= ThreatLevel::Medium);
+
+    let category_count = result.categories.len();
+
+    if has_critical || (has_high && category_count >= 2) {
+        ThreatLevel::Critical
+    } else if has_high {
+        ThreatLevel::High
+    } else if has_medium || category_count >= 2 {
+        ThreatLevel::Medium
+    } else if !result.categories.is_empty() {
+        ThreatLevel::Low
+    } else {
+        ThreatLevel::None
+    }
+}
+
+/// Confidence grows with the number of matched categories; strong attack
+/// categories (command injection, `SQLi`, known scanners) add a bonus.
+fn calculate_confidence(result: &ThreatResult) -> f64 {
+    let base = match result.categories.len() {
+        1 => 0.7_f64,
+        2 => 0.85_f64,
+        3..=4 => 0.95_f64,
+        _ => 1.0_f64,
+    };
+
+    let has_strong = result
+        .categories
+        .iter()
+        .copied()
+        .any(ThreatCategory::is_strong);
+
+    if has_strong {
+        (base + 0.1_f64).min(1.0_f64)
+    } else {
+        base
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +627,75 @@ mod tests {
         let display = format!("{result}");
         assert!(display.contains("High"));
         assert!(display.contains("SqlInjection"));
+    }
+
+    /// Every row of the pattern table must actually detect its own
+    /// category. If a rule is added to `patterns::PATTERN_RULES` and this
+    /// test fails, the rule (or its scope) is wrong.
+    #[test]
+    fn test_every_pattern_rule_detects_its_category() {
+        use patterns::{PATTERN_RULES, PatternScope};
+
+        let classifier = Classifier::new();
+
+        for rule in PATTERN_RULES {
+            let in_text = matches!(rule.scope, PatternScope::Text | PatternScope::TextAndPath);
+            let metadata = match rule.scope {
+                PatternScope::UserAgent => LogMetadata {
+                    user_agent: Some(rule.pattern.to_string()),
+                    ..LogMetadata::default()
+                },
+                PatternScope::Path | PatternScope::PathPrefix => LogMetadata {
+                    request_path: Some(rule.pattern.to_string()),
+                    ..LogMetadata::default()
+                },
+                PatternScope::Text | PatternScope::TextAndPath => LogMetadata::default(),
+            };
+            let message = if in_text {
+                rule.pattern.to_string()
+            } else {
+                "GET / 200".to_string()
+            };
+            let entry = make_entry(&message, LogLevel::Info, metadata);
+
+            let result = classifier.classify(&entry);
+            assert!(
+                result.categories.contains(&rule.category),
+                "pattern {:?} (scope {:?}) should be detected as {:?}",
+                rule.pattern,
+                rule.scope,
+                rule.category
+            );
+        }
+    }
+
+    /// The classifier must be total (never panic) and deterministic on any
+    /// input text, including binary garbage.
+    #[cfg(test)]
+    mod proptests {
+        use super::*;
+        use crate::log_scanner::parser::{LogMetadata, ParsedLogEntry};
+        use chrono::Utc;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn classifier_is_total_and_deterministic(
+                message in "[\\u{0}-\\u{ff}]{0,300}",
+            ) {
+                let entry = ParsedLogEntry {
+                    timestamp: Utc::now(),
+                    source_name: "proptest".into(),
+                    level: LogLevel::Info,
+                    message: message.clone(),
+                    raw: message,
+                    metadata: LogMetadata::default(),
+                };
+                let classifier = Classifier::new();
+                let first = classifier.classify(&entry);
+                let second = classifier.classify(&entry);
+                prop_assert_eq!(first, second);
+            }
+        }
     }
 }
