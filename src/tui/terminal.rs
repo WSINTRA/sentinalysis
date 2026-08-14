@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CrosstermEvent, KeyEventKind};
+use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind};
+use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -63,6 +64,7 @@ impl Tui {
         cancel_token: CancellationToken,
     ) {
         tokio::spawn(async move {
+            let mut event_stream = EventStream::new();
             let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
 
             loop {
@@ -73,18 +75,15 @@ impl Tui {
                             break;
                         }
                     }
-                    else => {
-                        let has_event = tokio::task::block_in_place(|| {
-                            event::poll(Duration::from_millis(1)).unwrap_or(false)
-                        });
-
-                        if has_event
-                            && let Ok(crossterm_event) = event::read()
-                        {
-                            let app_event = Self::map_event(&crossterm_event);
-                            if event_tx.send(app_event).await.is_err() {
-                                break;
+                    result = event_stream.next() => {
+                        match result {
+                            Some(Ok(crossterm_event)) => {
+                                let app_event = Self::map_event(&crossterm_event);
+                                if event_tx.send(app_event).await.is_err() {
+                                    break;
+                                }
                             }
+                            Some(Err(_)) | None => break,
                         }
                     }
                 }
