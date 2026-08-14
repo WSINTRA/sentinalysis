@@ -1,10 +1,13 @@
+//! Bottom status line: key hints plus an optional transient message.
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::error::SentinelError;
 use crate::tui::action::Action;
-use crate::tui::components::Component;
+use crate::tui::components::{BoxedFuture, Component};
 
 #[derive(Default)]
 pub struct StatusBar {
@@ -35,11 +38,11 @@ impl StatusBar {
 }
 
 impl Component for StatusBar {
-    fn handle_action(
-        &mut self,
-        _action: &Action,
-    ) -> Result<Option<Action>, crate::error::SentinelError> {
-        Ok(None)
+    fn handle_action<'a>(
+        &'a mut self,
+        _action: &'a Action,
+    ) -> BoxedFuture<'a, Result<Option<Action>, SentinelError>> {
+        Box::pin(async { Ok(None) })
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {

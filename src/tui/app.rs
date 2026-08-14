@@ -1,10 +1,13 @@
+//! The TUI application: composes the viewer and status bar components and
+//! forwards the lifecycle calls (init / action / draw) to them.
+
 use sqlx::PgPool;
 
-use crate::config::Config;
 use crate::error::SentinelError;
 use crate::tui::action::Action;
 use crate::tui::components::Composite;
 
+/// Display metadata for a source (vhost or system log) in the sources panel.
 #[derive(Debug, Clone)]
 pub struct VirtualHostInfo {
     pub name: String,
@@ -19,6 +22,7 @@ pub enum VirtualHostSource {
     JournalctlConfig,
 }
 
+/// One log entry as shown in the entry list.
 #[derive(Debug, Clone)]
 pub struct DisplayLogEntry {
     pub id: uuid::Uuid,
@@ -33,25 +37,17 @@ pub struct DisplayLogEntry {
 
 pub struct App {
     composite: Composite,
-    _config: Config,
 }
 
 impl App {
     #[must_use]
-    pub fn new(pool: PgPool, config: Config) -> Self {
-        let (entry_tx, _entry_rx) = tokio::sync::mpsc::unbounded_channel();
-
+    pub fn new(pool: PgPool) -> Self {
         let composite = Composite::new(vec![
-            Box::new(crate::tui::components::log_viewer::LogViewer::new(
-                pool, entry_tx,
-            )),
+            Box::new(crate::tui::components::log_viewer::LogViewer::new(pool)),
             Box::new(crate::tui::components::status_bar::StatusBar::new()),
         ]);
 
-        Self {
-            composite,
-            _config: config,
-        }
+        Self { composite }
     }
 
     pub async fn init(&mut self) -> Result<(), SentinelError> {
@@ -59,8 +55,11 @@ impl App {
         Ok(())
     }
 
-    pub fn handle_action(&mut self, action: &Action) -> Result<Option<Action>, SentinelError> {
-        self.composite.handle_action(action)
+    pub async fn handle_action(
+        &mut self,
+        action: &Action,
+    ) -> Result<Option<Action>, SentinelError> {
+        self.composite.handle_action(action).await
     }
 
     pub fn draw(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {

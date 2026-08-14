@@ -1,3 +1,10 @@
+//! Actions routed through the TUI components.
+//!
+//! Keyboard events and ticks are mapped to an [`Action`] in
+//! `terminal::Tui`; components consume it or propagate a replacement.
+//! `ScrollUp`, `ScrollDown`, `LogEntryAdded`, and `LoadOlderEntries` are
+//! reserved for features that are not implemented yet.
+
 use strum::Display;
 
 #[derive(Debug, Clone, Display, PartialEq)]

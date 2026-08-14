@@ -4,7 +4,6 @@ use std::process;
 use clap::Parser;
 use tracing::{error, info};
 
-use sentinel::config::Config;
 use sentinel::db::pool::create_pool;
 use sentinel::error::SentinelError;
 
@@ -58,16 +57,16 @@ async fn run() -> Result<(), SentinelError> {
 
     if cli.tui {
         ensure_daemon_running().await?;
-        run_tui(pool, config).await
+        run_tui(pool).await
     } else {
         run_daemon(pool, config).await
     }
 }
 
-async fn run_tui(pool: sqlx::PgPool, config: Config) -> Result<(), SentinelError> {
+async fn run_tui(pool: sqlx::PgPool) -> Result<(), SentinelError> {
     info!("TUI mode starting");
 
-    let app = sentinel::tui::app::App::new(pool, config);
+    let app = sentinel::tui::app::App::new(pool);
     let mut tui = sentinel::tui::Tui::new()?;
 
     tui.run(app).await

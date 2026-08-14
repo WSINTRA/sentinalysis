@@ -1,3 +1,9 @@
+//! Terminal setup and the TUI event loop.
+//!
+//! A spawned task pumps crossterm events (plus a 100 ms tick) into a
+//! channel; the main task draws a frame and then processes one event per
+//! loop iteration.
+
 use std::time::Duration;
 
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEventKind};
@@ -117,7 +123,7 @@ impl Tui {
                 continue;
             };
 
-            if let Some(next_action) = app.handle_action(&action)?
+            if let Some(next_action) = app.handle_action(&action).await?
                 && next_action == Action::Quit
             {
                 break;
