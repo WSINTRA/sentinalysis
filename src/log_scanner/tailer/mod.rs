@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Flaky on macOS FSEvents; verify on Linux with inotify"]
+    #[cfg_attr(target_os = "macos", ignore = "Flaky on macOS FSEvents")]
     async fn test_tailer_detects_new_lines() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.log");
@@ -456,19 +456,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_tail_line_structure() {
-        let line = TailLine {
-            file_path: PathBuf::from("/var/log/test.log"),
-            line: "test message".to_string(),
-            byte_offset: 100,
-        };
-
-        assert_eq!(line.line, "test message");
-        assert_eq!(line.byte_offset, 100);
-        assert_eq!(line.file_path, PathBuf::from("/var/log/test.log"));
-    }
-
     #[tokio::test]
     async fn test_tailer_discovers_existing_logs_in_directory() {
         let temp_dir = TempDir::new().unwrap();
@@ -494,7 +481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Flaky on macOS FSEvents; verify on Linux with inotify"]
+    #[cfg_attr(target_os = "macos", ignore = "Flaky on macOS FSEvents")]
     async fn test_tailer_auto_tails_new_log_in_directory() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().join("logs");
@@ -531,7 +518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Flaky on macOS FSEvents; verify on Linux with inotify"]
+    #[cfg_attr(target_os = "macos", ignore = "Flaky on macOS FSEvents")]
     async fn test_tailer_handles_log_rotation() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().join("logs");
@@ -575,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Flaky on macOS FSEvents; verify on Linux with inotify"]
+    #[cfg_attr(target_os = "macos", ignore = "Flaky on macOS FSEvents")]
     async fn test_tailer_ignores_rotated_files_created_directly() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().join("logs");
