@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -6,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use sqlx::PgPool;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::error::SentinelError;
 use crate::log_scanner::classifier::ThreatLevel;
@@ -16,6 +17,13 @@ use crate::tui::app::{DisplayLogEntry, VirtualHostInfo, VirtualHostSource};
 use crate::tui::components::{BoxedFuture, Component};
 
 const MAX_ENTRIES_PER_HOST: usize = 1000;
+const NGINX_LOG_DIR: &str = "/var/log/nginx";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PanelFocus {
+    HostList,
+    LogList,
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct DbLogEntry {
@@ -37,6 +45,7 @@ pub struct LogViewer {
     selected_host: Option<String>,
     filter_mode: bool,
     filter_text: String,
+    focus: PanelFocus,
 }
 
 impl LogViewer {
@@ -58,44 +67,84 @@ impl LogViewer {
             selected_host: None,
             filter_mode: false,
             filter_text: String::new(),
+            focus: PanelFocus::HostList,
         }
     }
 
     async fn load_virtual_hosts(&mut self) -> Result<(), SentinelError> {
-        let db_hosts: Vec<(String, i64)> = sqlx::query_as(
+        let log_dir = Path::new(NGINX_LOG_DIR);
+
+        if !log_dir.exists() {
+            self.virtual_hosts = vec![VirtualHostInfo {
+                name: format!("Log directory not found: {NGINX_LOG_DIR}"),
+                source: VirtualHostSource::LogEntry,
+                entry_count: 0,
+            }];
+            return Ok(());
+        }
+
+        let mut discovered_hosts = Vec::new();
+
+        let entries = match std::fs::read_dir(log_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                error!("Failed to read log directory {}: {e}", log_dir.display());
+                self.virtual_hosts = vec![VirtualHostInfo {
+                    name: format!("Cannot read {NGINX_LOG_DIR}: {e}"),
+                    source: VirtualHostSource::LogEntry,
+                    entry_count: 0,
+                }];
+                return Ok(());
+            }
+        };
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.ends_with("-access.log") && !file_name.ends_with("-access.log.1") {
+                let vhost_name = file_name.trim_end_matches("-access.log").to_string();
+                discovered_hosts.push(vhost_name);
+            }
+        }
+
+        discovered_hosts.sort();
+
+        if discovered_hosts.is_empty() {
+            self.virtual_hosts = vec![VirtualHostInfo {
+                name: "No *-access.log files found".to_string(),
+                source: VirtualHostSource::LogEntry,
+                entry_count: 0,
+            }];
+            info!("No virtual hosts discovered from log files");
+            return Ok(());
+        }
+
+        let hosts: Vec<String> = discovered_hosts.clone();
+        let db_counts: Vec<(String, i64)> = sqlx::query_as(
             r"
             SELECT s.virtual_host, COUNT(*) as cnt
             FROM log_entries le
             JOIN services s ON le.service_id = s.id
-            WHERE s.virtual_host IS NOT NULL
+            WHERE s.virtual_host = ANY($1)
             GROUP BY s.virtual_host
-            ORDER BY cnt DESC
             ",
         )
+        .bind(hosts)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| SentinelError::DatabaseError(e.to_string()))?;
 
-        self.virtual_hosts = db_hosts
+        let counts: HashMap<String, i64> = db_counts.into_iter().collect();
+
+        self.virtual_hosts = discovered_hosts
             .into_iter()
-            .map(|(name, _count)| VirtualHostInfo {
-                name,
+            .map(|name| VirtualHostInfo {
+                name: name.clone(),
                 source: VirtualHostSource::LogEntry,
-                entry_count: MAX_ENTRIES_PER_HOST,
+                entry_count: counts.get(&name).copied().unwrap_or(0) as usize,
             })
             .collect();
 
-        if self.virtual_hosts.is_empty() {
-            self.virtual_hosts.push(VirtualHostInfo {
-                name: "No logs yet".to_string(),
-                source: VirtualHostSource::LogEntry,
-                entry_count: 0,
-            });
-        }
-
-        self.virtual_hosts.sort_by(|a, b| a.name.cmp(&b.name));
-
-        info!("Loaded {} virtual hosts", self.virtual_hosts.len());
+        info!("Loaded {} virtual hosts from log files", self.virtual_hosts.len());
         Ok(())
     }
 
@@ -208,8 +257,20 @@ impl LogViewer {
             })
             .collect();
 
+        let focused = self.focus == PanelFocus::HostList;
+        let border_style = if focused {
+            Style::new().fg(Color::Cyan)
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
+
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Virtual Hosts"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Virtual Hosts")
+                    .border_style(border_style),
+            )
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
 
         frame.render_stateful_widget(list, area, &mut self.host_state);
@@ -247,11 +308,19 @@ impl LogViewer {
             ""
         };
 
+        let focused = self.focus == PanelFocus::LogList;
+        let border_style = if focused {
+            Style::new().fg(Color::Cyan)
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
+
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("Logs: {title}{filter_indicator}")),
+                    .title(format!("Logs: {title}{filter_indicator}"))
+                    .border_style(border_style),
             )
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
 
@@ -292,24 +361,56 @@ impl Component for LogViewer {
 
         match action {
             Action::Quit => Ok(Some(Action::Quit)),
+            Action::ToggleFocus => {
+                self.focus = match self.focus {
+                    PanelFocus::HostList => PanelFocus::LogList,
+                    PanelFocus::LogList => PanelFocus::HostList,
+                };
+                Ok(None)
+            }
             Action::SelectUp => {
-                if let Some(i) = self.host_state.selected() {
-                    self.host_state.select(Some(i.saturating_sub(1)));
+                match self.focus {
+                    PanelFocus::HostList => {
+                        if let Some(i) = self.host_state.selected() {
+                            self.host_state.select(Some(i.saturating_sub(1)));
+                        }
+                    }
+                    PanelFocus::LogList => {
+                        if let Some(i) = self.log_state.selected() {
+                            self.log_state.select(Some(i.saturating_sub(1)));
+                        }
+                    }
                 }
                 Ok(None)
             }
             Action::SelectDown => {
-                if let Some(i) = self.host_state.selected() {
-                    self.host_state
-                        .select(Some((i + 1).min(self.virtual_hosts.len().saturating_sub(1))));
+                match self.focus {
+                    PanelFocus::HostList => {
+                        if let Some(i) = self.host_state.selected() {
+                            self.host_state
+                                .select(Some((i + 1).min(self.virtual_hosts.len().saturating_sub(1))));
+                        }
+                    }
+                    PanelFocus::LogList => {
+                        if let Some(i) = self.log_state.selected() {
+                            let max = self
+                                .selected_host
+                                .as_ref()
+                                .and_then(|h| self.log_entries.get(h).map(|v| v.len().saturating_sub(1)))
+                                .unwrap_or(0);
+                            self.log_state.select(Some((i + 1).min(max)));
+                        }
+                    }
                 }
                 Ok(None)
             }
             Action::Refresh => {
                 if let Some(selected) = self.host_state.selected()
                     && let Some(host) = self.virtual_hosts.get(selected).map(|h| h.name.clone())
+                    && self.selected_host.as_ref() != Some(&host)
                 {
-                    self.selected_host = Some(host);
+                    self.selected_host = Some(host.clone());
+                    self.log_state.select(Some(0));
                 }
                 Ok(None)
             }

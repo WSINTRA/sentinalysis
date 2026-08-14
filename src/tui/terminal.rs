@@ -146,6 +146,7 @@ impl Tui {
             crossterm::event::KeyCode::Char('q') => Action::Quit,
             crossterm::event::KeyCode::Up => Action::SelectUp,
             crossterm::event::KeyCode::Down => Action::SelectDown,
+            crossterm::event::KeyCode::Tab => Action::ToggleFocus,
             crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('r') => {
                 Action::Refresh
             }

@@ -49,4 +49,7 @@ pub enum Action {
 
     #[strum(to_string = "LoadOlderEntries")]
     LoadOlderEntries,
+
+    #[strum(to_string = "ToggleFocus")]
+    ToggleFocus,
 }
