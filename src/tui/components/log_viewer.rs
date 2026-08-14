@@ -411,6 +411,9 @@ impl Component for LogViewer {
                 {
                     self.selected_host = Some(host.clone());
                     self.log_state.select(Some(0));
+                    let _ = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(self.load_recent_entries(&host))
+                    });
                 }
                 Ok(None)
             }
