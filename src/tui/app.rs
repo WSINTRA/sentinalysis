@@ -21,7 +21,7 @@ pub enum VirtualHostSource {
 
 #[derive(Debug, Clone)]
 pub struct DisplayLogEntry {
-    pub id: i64,
+    pub id: uuid::Uuid,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub level: crate::log_scanner::parser::LogLevel,
     pub threat_level: crate::log_scanner::classifier::ThreatLevel,

@@ -19,7 +19,7 @@ const MAX_ENTRIES_PER_HOST: usize = 1000;
 
 #[derive(Debug, sqlx::FromRow)]
 struct DbLogEntry {
-    id: i64,
+    id: uuid::Uuid,
     timestamp: chrono::DateTime<chrono::Utc>,
     level: String,
     message: String,
