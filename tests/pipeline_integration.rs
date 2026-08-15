@@ -19,6 +19,10 @@ use sentinel::log_scanner::tailer::FileTailer;
 const CLEAN_LINE: &str = "10.0.0.1 - - [01/Jan/2025:00:00:00 +0000] \"GET /index.html HTTP/1.1\" 200 15 \"-\" \"curl/8.0\" \"shop.example.com\" 0.1";
 const ATTACK_LINE: &str = "10.0.0.2 - - [01/Jan/2025:00:00:01 +0000] \"GET /users?id=1 UNION SELECT * FROM passwords HTTP/1.1\" 400 0 \"-\" \"curl/8.0\" \"shop.example.com\" 0.1";
 const NOISE_LINE: &str = "127.0.0.1 - - [01/Jan/2025:00:00:02 +0000] \"GET /health HTTP/1.1\" 200 15 \"-\" \"HealthChecker/1.0\" \"shop.example.com\" 0.001";
+/// Health check from a non-excluded IP: noise via aggregation.
+const HEALTHCHECK_LINE: &str = "203.0.113.7 - - [01/Jan/2025:00:00:03 +0000] \"GET /health HTTP/1.1\" 200 15 \"-\" \"HealthChecker/1.0\" \"shop.example.com\" 0.001";
+/// Reconnaissance against a known scanner endpoint: security event.
+const SCANNER_LINE: &str = "203.0.113.9 - - [01/Jan/2025:00:00:04 +0000] \"GET /wp-admin HTTP/1.1\" 404 0 \"-\" \"curl/8.0\" \"shop.example.com\" 0.01";
 
 /// The shared destination for flushed entries; clone the `Arc` to observe
 /// it from outside the spawned scanner task.
@@ -70,7 +74,7 @@ async fn test_file_to_sink_end_to_end() {
     let log_path = temp_dir.path().join("shop.example.com-access.log");
     std::fs::write(
         &log_path,
-        format!("{CLEAN_LINE}\n{ATTACK_LINE}\n{NOISE_LINE}\n"),
+        format!("{CLEAN_LINE}\n{ATTACK_LINE}\n{NOISE_LINE}\n{HEALTHCHECK_LINE}\n{SCANNER_LINE}\n"),
     )
     .unwrap();
 
@@ -94,7 +98,7 @@ async fn test_file_to_sink_end_to_end() {
         scanner.run(rx, &sink).await.unwrap();
     });
 
-    wait_for_entries(&observed, 3).await;
+    wait_for_entries(&observed, 5).await;
 
     cancel.cancel();
     tailer.stop();
@@ -138,9 +142,28 @@ async fn test_file_to_sink_end_to_end() {
 
     let noise = entries
         .iter()
-        .find(|e| e.request_path.as_deref() == Some("/health"))
+        .find(|e| e.client_ip.as_deref() == Some("127.0.0.1"))
         .expect("noise line must be stored");
     assert!(noise.is_noise, "loopback health check is default noise");
     assert!(noise.noise_reason.is_some());
     assert!(noise.raw_line.is_none(), "noise lines drop their raw line");
+
+    let healthcheck = entries
+        .iter()
+        .find(|e| e.client_ip.as_deref() == Some("203.0.113.7"))
+        .expect("external health check must be stored");
+    assert!(healthcheck.is_noise, "health checks are noise from any IP");
+    assert!(
+        healthcheck.raw_line.is_none(),
+        "aggregated noise drops its raw line"
+    );
+
+    let scanner = entries
+        .iter()
+        .find(|e| e.request_path.as_deref() == Some("/wp-admin"))
+        .expect("scanner path must be stored");
+    assert_eq!(
+        scanner.level, "security",
+        "reconnaissance endpoints are stored as security events"
+    );
 }

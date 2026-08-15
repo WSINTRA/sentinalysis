@@ -271,9 +271,16 @@ impl Pipeline {
             let filter_result = self.filter.evaluate(&entry);
             let threat = self.classifier.classify(&entry);
 
-            let is_noise = matches!(filter_result, FilterResult::Exclude(_));
+            // Exclude and Aggregate are both stored as noise (raw line
+            // suppressed); FlagSecurity is stored as a security event.
+            let is_noise = matches!(
+                filter_result,
+                FilterResult::Exclude(_) | FilterResult::Aggregate(_)
+            );
             let noise_reason = match &filter_result {
-                FilterResult::Exclude(reason) => Some(reason.clone()),
+                FilterResult::Exclude(reason) | FilterResult::Aggregate(reason) => {
+                    Some(reason.clone())
+                }
                 _ => None,
             };
 
@@ -296,7 +303,10 @@ impl Pipeline {
                     .await
             };
 
-            let level = Self::classify_level(entry.level, &threat);
+            let mut level = Self::classify_level(entry.level, &threat);
+            if filter_result.is_security_flag() {
+                level = LogLevel::Security;
+            }
 
             Ok(Some(InsertLogEntry {
                 service_id,
@@ -412,6 +422,75 @@ mod tests {
         assert_eq!(entry.client_ip, Some("192.168.1.100".to_string()));
         assert_eq!(entry.threat_level, "medium");
         assert_eq!(entry.threat_categories, vec!["brute-force"]);
+    }
+
+    /// A health check from a non-excluded IP is noise: stored without a
+    /// raw line, with the filter's reason.
+    #[tokio::test]
+    async fn test_health_check_from_non_excluded_ip_is_noise() {
+        let p = pipeline();
+        let line = tail_line(
+            "app.example.com-access.log",
+            "203.0.113.7 - - [01/Jan/2025:00:00:00 +0000] \"GET /health HTTP/1.1\" 200 15 \"-\" \"HealthChecker/1.0\" \"app.example.com\" 0.001",
+        );
+
+        let entry = p.process_line(&line).await.unwrap().unwrap();
+
+        assert!(entry.is_noise);
+        assert!(entry.raw_line.is_none());
+        assert_eq!(entry.noise_reason.as_deref(), Some("health check"));
+    }
+
+    /// Static assets are noise regardless of client.
+    #[tokio::test]
+    async fn test_static_asset_is_noise() {
+        let p = pipeline();
+        let line = tail_line(
+            "app.example.com-access.log",
+            "203.0.113.8 - - [01/Jan/2025:00:00:00 +0000] \"GET /styles/main.css HTTP/1.1\" 200 1500 \"-\" \"Mozilla/5.0\" \"app.example.com\" 0.02",
+        );
+
+        let entry = p.process_line(&line).await.unwrap().unwrap();
+
+        assert!(entry.is_noise);
+        assert!(entry.raw_line.is_none());
+        assert_eq!(entry.noise_reason.as_deref(), Some("static asset"));
+    }
+
+    /// Known bot user agents are noise.
+    #[tokio::test]
+    async fn test_bot_user_agent_is_noise() {
+        let p = pipeline();
+        let line = tail_line(
+            "app.example.com-access.log",
+            "66.249.65.1 - - [01/Jan/2025:00:00:00 +0000] \"GET / HTTP/1.1\" 200 15 \"-\" \"Mozilla/5.0 (compatible; Googlebot/2.1)\" \"app.example.com\" 0.1",
+        );
+
+        let entry = p.process_line(&line).await.unwrap().unwrap();
+
+        assert!(entry.is_noise);
+        assert!(entry.raw_line.is_none());
+        assert!(
+            entry
+                .noise_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("bot:"))
+        );
+    }
+
+    /// Reconnaissance against a known scanner endpoint is stored as a
+    /// security event even without a classified threat.
+    #[tokio::test]
+    async fn test_scanner_path_is_stored_as_security() {
+        let p = pipeline();
+        let line = tail_line(
+            "app.example.com-access.log",
+            "203.0.113.9 - - [01/Jan/2025:00:00:00 +0000] \"GET /wp-admin HTTP/1.1\" 404 0 \"-\" \"curl/8.0\" \"app.example.com\" 0.01",
+        );
+
+        let entry = p.process_line(&line).await.unwrap().unwrap();
+
+        assert_eq!(entry.level, "security");
     }
 
     #[tokio::test]

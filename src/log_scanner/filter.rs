@@ -1,14 +1,14 @@
 //! Noise filtering for parsed log entries.
 //!
 //! `NoiseFilter` decides what to do with a `ParsedLogEntry` before it is
-//! stored: keep it, exclude it entirely, aggregate it (noise such as bots
-//! or static assets), or flag it as a security event. The detection rules
-//! come from `NoiseFilterConfig`; security *categorisation* (which kind of
-//! attack) belongs to the `Classifier`, and this filter defers to it for
-//! `SQLi` / path-traversal detection.
+//! stored: keep it, store it as noise (excluded IPs, health checks,
+//! static assets, known bots), or flag it as a security event
+//! (reconnaissance against known scanner endpoints). The detection rules
+//! come from `NoiseFilterConfig`; threat *categorisation* (which kind of
+//! attack a request is) belongs to the `Classifier`, which the pipeline
+//! runs separately — this filter only decides noise.
 
 use crate::config::NoiseFilterConfig;
-use crate::log_scanner::classifier::Classifier;
 use crate::log_scanner::parser::ParsedLogEntry;
 use regex::Regex;
 use std::net::IpAddr;
@@ -25,8 +25,6 @@ pub struct NoiseFilter {
     static_asset_pattern: Arc<Regex>,
     bot_user_agents: Vec<Arc<Regex>>,
     scanner_paths: Arc<Regex>,
-    /// Shared classifier used to detect `SQLi` / path traversal in requests.
-    classifier: Arc<Classifier>,
 }
 
 impl NoiseFilter {
@@ -90,7 +88,6 @@ impl NoiseFilter {
                 )
                 .expect("hardcoded scanner paths regex must be valid"),
             ),
-            classifier: Arc::new(Classifier::new()),
         }
     }
 
@@ -139,19 +136,6 @@ impl NoiseFilter {
             }
         }
 
-        // Attack detection is owned by the classifier; the filter only
-        // translates the result into a storage decision.
-        let threat = self.classifier.classify(entry);
-        if threat.categories.iter().any(|c| {
-            matches!(
-                c,
-                crate::log_scanner::classifier::ThreatCategory::SqlInjection
-                    | crate::log_scanner::classifier::ThreatCategory::PathTraversal
-            )
-        }) {
-            return FilterResult::FlagSecurity("attack pattern in request".to_string());
-        }
-
         FilterResult::Keep
     }
 }
@@ -167,7 +151,8 @@ impl Default for NoiseFilter {
 pub enum FilterResult {
     /// Store the entry as-is.
     Keep,
-    /// Drop the entry entirely.
+    /// Store as noise (raw line suppressed): the entry is recorded for
+    /// counting, but its content is dropped.
     Exclude(String),
     /// Store as noise (raw line suppressed).
     Aggregate(String),
@@ -333,8 +318,11 @@ mod tests {
         ));
     }
 
+    /// Attack detection (`SQLi`, path traversal, ...) is the classifier's
+    /// job, not the filter's: attack lines are kept so the classifier can
+    /// classify and store them.
     #[test]
-    fn test_sql_injection_flagged() {
+    fn test_sql_injection_not_filtered() {
         let filter = NoiseFilter::new();
         let entry = make_entry(
             IpAddr::from([192, 168, 1, 1]),
@@ -342,26 +330,20 @@ mod tests {
             "curl/8.0",
             400,
         );
-        assert!(matches!(
-            filter.evaluate(&entry),
-            FilterResult::FlagSecurity(_)
-        ));
+        assert_eq!(filter.evaluate(&entry), FilterResult::Keep);
     }
 
     #[rstest]
     #[case("/api?id=' or '1'='1")]
     #[case("/api?drop table users")]
-    fn test_various_sql_injection_flagged(#[case] path: &str) {
+    fn test_various_sql_injection_not_filtered(#[case] path: &str) {
         let filter = NoiseFilter::new();
         let entry = make_entry(IpAddr::from([192, 168, 1, 1]), path, "curl/8.0", 400);
-        assert!(matches!(
-            filter.evaluate(&entry),
-            FilterResult::FlagSecurity(_)
-        ));
+        assert_eq!(filter.evaluate(&entry), FilterResult::Keep);
     }
 
     #[test]
-    fn test_path_traversal_flagged() {
+    fn test_path_traversal_not_filtered() {
         let filter = NoiseFilter::new();
         let entry = make_entry(
             IpAddr::from([192, 168, 1, 1]),
@@ -369,10 +351,7 @@ mod tests {
             "curl/8.0",
             403,
         );
-        assert!(matches!(
-            filter.evaluate(&entry),
-            FilterResult::FlagSecurity(_)
-        ));
+        assert_eq!(filter.evaluate(&entry), FilterResult::Keep);
     }
 
     #[test]
