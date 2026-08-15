@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use crate::log_scanner::classifier::ThreatLevel;
 use crate::log_scanner::parser::LogLevel;
-use crate::tui::app::DisplayLogEntry;
+use crate::tui::data::DisplayLogEntry;
 
 use super::{LogViewer, PanelFocus};
 
@@ -33,7 +33,7 @@ impl LogViewer {
             Line::raw("Virtual Hosts").style(Style::new().add_modifier(Modifier::BOLD)),
         ));
         for h in &self.virtual_hosts {
-            items.push(ListItem::new(Line::raw(format!("[L] {}", h.name))));
+            items.push(ListItem::new(Line::raw(format!("[L] {}", h.source.name))));
         }
 
         if !self.system_logs.is_empty() {
@@ -41,7 +41,7 @@ impl LogViewer {
                 Line::raw("System Logs").style(Style::new().add_modifier(Modifier::BOLD)),
             ));
             for h in &self.system_logs {
-                items.push(ListItem::new(Line::raw(format!("[S] {}", h.name))));
+                items.push(ListItem::new(Line::raw(format!("[S] {}", h.source.name))));
             }
         }
 
@@ -64,12 +64,15 @@ impl LogViewer {
     }
 
     fn render_log_list(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        let title = self.selected_host.as_deref().unwrap_or("No host selected");
+        let title = self
+            .selected_source
+            .as_ref()
+            .map_or("No source selected", |s| s.name.as_str());
 
         let entries = self
-            .selected_host
+            .selected_source
             .as_ref()
-            .and_then(|h| self.log_entries.get(h).map(Vec::as_slice))
+            .and_then(|s| self.log_entries.get(&s.name).map(Vec::as_slice))
             .unwrap_or(&[]);
 
         let filtered: Vec<&DisplayLogEntry> = if self.filter_text.is_empty() {

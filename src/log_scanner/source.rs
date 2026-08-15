@@ -73,6 +73,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_source_constructors_set_kind() {
+        let vhost = Source::vhost("api.example.com");
+        assert_eq!(vhost.kind, SourceKind::Vhost);
+        assert_eq!(vhost.name, "api.example.com");
+
+        let system = Source::system_log("auth.log");
+        assert_eq!(system.kind, SourceKind::SystemLog);
+        assert_eq!(system.name, "auth.log");
+    }
+
+    #[test]
     fn test_vhost_from_file_path() {
         assert_eq!(
             vhost_from_file_path(Path::new("/var/log/nginx/api.example.com-access.log")),

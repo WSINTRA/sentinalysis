@@ -6,6 +6,7 @@
 pub mod action;
 pub mod app;
 pub mod components;
+pub mod data;
 pub mod terminal;
 
 pub use terminal::Tui;

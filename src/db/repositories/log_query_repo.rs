@@ -12,16 +12,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::SentinelError;
-
-/// The kind of source a log list in the viewer belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogSourceKind {
-    /// An nginx virtual host, matched on `services.virtual_host`.
-    Vhost,
-    /// A plain log file (e.g. `auth.log`), matched on `services.name`
-    /// with no virtual host set.
-    SystemLog,
-}
+use crate::log_scanner::source::SourceKind;
 
 /// One row of the TUI log list, for either source kind.
 #[derive(Debug, Clone, FromRow)]
@@ -97,12 +88,12 @@ impl LogQueryRepository {
     /// Sources with zero entries are absent from the result.
     pub async fn count_entries(
         &self,
-        kind: LogSourceKind,
+        kind: SourceKind,
         names: &[String],
     ) -> Result<Vec<(String, i64)>, SentinelError> {
         let sql = match kind {
-            LogSourceKind::Vhost => COUNT_VHOST_SQL,
-            LogSourceKind::SystemLog => COUNT_SYSTEM_LOG_SQL,
+            SourceKind::Vhost => COUNT_VHOST_SQL,
+            SourceKind::SystemLog => COUNT_SYSTEM_LOG_SQL,
         };
         let rows: Vec<(String, i64)> = sqlx::query_as(sql)
             .bind(names.to_vec())
@@ -114,13 +105,13 @@ impl LogQueryRepository {
     /// The most recent `limit` entries for `name`, newest first.
     pub async fn recent_entries(
         &self,
-        kind: LogSourceKind,
+        kind: SourceKind,
         name: &str,
         limit: i64,
     ) -> Result<Vec<LogEntryRow>, SentinelError> {
         let sql = match kind {
-            LogSourceKind::Vhost => RECENT_VHOST_SQL,
-            LogSourceKind::SystemLog => RECENT_SYSTEM_LOG_SQL,
+            SourceKind::Vhost => RECENT_VHOST_SQL,
+            SourceKind::SystemLog => RECENT_SYSTEM_LOG_SQL,
         };
         Ok(sqlx::query_as::<_, LogEntryRow>(sql)
             .bind(name)
@@ -133,15 +124,15 @@ impl LogQueryRepository {
     /// first, up to `limit`.
     pub async fn newer_entries(
         &self,
-        kind: LogSourceKind,
+        kind: SourceKind,
         name: &str,
         since: DateTime<Utc>,
         since_id: Uuid,
         limit: i64,
     ) -> Result<Vec<LogEntryRow>, SentinelError> {
         let sql = match kind {
-            LogSourceKind::Vhost => NEWER_VHOST_SQL,
-            LogSourceKind::SystemLog => NEWER_SYSTEM_LOG_SQL,
+            SourceKind::Vhost => NEWER_VHOST_SQL,
+            SourceKind::SystemLog => NEWER_SYSTEM_LOG_SQL,
         };
         Ok(sqlx::query_as::<_, LogEntryRow>(sql)
             .bind(name)

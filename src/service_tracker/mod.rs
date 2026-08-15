@@ -4,7 +4,7 @@
 //! ([`monitor`]), and journalctl tailing ([`journalctl`]) are built and
 //! unit-tested, but nothing outside this module references them yet.
 //! They are the planned foundation for a "System Services" data source
-//! (see `VirtualHostSource::SystemdService` and `JournalctlConfig`).
+//! (see `SourceKind` and `JournalctlConfig`).
 
 pub mod discoverer;
 pub mod journalctl;

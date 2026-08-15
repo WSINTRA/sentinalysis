@@ -7,34 +7,6 @@ use crate::error::SentinelError;
 use crate::tui::action::Action;
 use crate::tui::components::Composite;
 
-/// Display metadata for a source (vhost or system log) in the sources panel.
-#[derive(Debug, Clone)]
-pub struct VirtualHostInfo {
-    pub name: String,
-    pub source: VirtualHostSource,
-    pub entry_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum VirtualHostSource {
-    LogEntry,
-    SystemdService,
-    JournalctlConfig,
-}
-
-/// One log entry as shown in the entry list.
-#[derive(Debug, Clone)]
-pub struct DisplayLogEntry {
-    pub id: uuid::Uuid,
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    pub level: crate::log_scanner::parser::LogLevel,
-    pub threat_level: crate::log_scanner::classifier::ThreatLevel,
-    pub message: String,
-    pub raw: String,
-    pub virtual_host: String,
-    pub threat_categories: Vec<String>,
-}
-
 pub struct App {
     composite: Composite,
 }
