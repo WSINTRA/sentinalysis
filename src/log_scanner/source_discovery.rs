@@ -12,7 +12,7 @@
 //! each group sorted by name.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use glob::Pattern;
 
@@ -42,7 +42,7 @@ impl SourceDiscovery {
         let mut system_logs: BTreeSet<String> = BTreeSet::new();
 
         for dir in &self.directories {
-            self.discover_directory(dir, &mut vhosts, &mut system_logs);
+            Self::discover_directory(dir, &mut vhosts, &mut system_logs);
         }
 
         for file in &self.files {
@@ -59,7 +59,6 @@ impl SourceDiscovery {
     }
 
     fn discover_directory(
-        &self,
         dir: &crate::config::LogDirectoryConfig,
         vhosts: &mut BTreeSet<String>,
         system_logs: &mut BTreeSet<String>,
@@ -97,6 +96,7 @@ impl SourceDiscovery {
 mod tests {
     use super::*;
     use crate::config::LogDirectoryConfig;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn discovery(dirs: Vec<LogDirectoryConfig>, files: Vec<PathBuf>) -> SourceDiscovery {
