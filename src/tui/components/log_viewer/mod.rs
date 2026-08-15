@@ -95,16 +95,16 @@ impl<D: LogDataSource> LogViewer<D> {
         Ok(())
     }
 
-    /// Poll the database for entries newer than the oldest one on screen
+    /// Poll the database for entries newer than the newest one on screen
     /// and prepend them to the cached list for `source`.
     async fn check_new_entries(&mut self, source: &Source) -> Result<(), SentinelError> {
-        // Entries are stored newest-first, so the last one is the oldest on
-        // screen; everything newer than it is still missing.
+        // Entries are stored newest-first, so the first one is the newest
+        // on screen; anything still missing must be newer than it.
         let Some((since, since_id)) = self
             .log_entries
             .get(&source.name)
-            .and_then(|entries| entries.last())
-            .map(|oldest| (oldest.timestamp, oldest.id))
+            .and_then(|entries| entries.first())
+            .map(|newest| (newest.timestamp, newest.id))
         else {
             return Ok(());
         };
@@ -517,6 +517,122 @@ mod tests {
         v.log_entries
             .insert("h".to_string(), vec![display_entry(1, Utc::now())]);
         v
+    }
+
+    /// Newest-first entries `entry 1`..`entry count` with distinct
+    /// increasing timestamps (`entry count` is the newest).
+    fn seq_entries(t0: DateTime<Utc>, count: u64) -> Vec<DisplayLogEntry> {
+        (1..=count)
+            .map(|seq| {
+                display_entry(
+                    seq,
+                    t0 + chrono::TimeDelta::try_seconds(i64::try_from(seq).unwrap()).unwrap(),
+                )
+            })
+            .rev()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_check_new_entries_prepends_only_genuinely_new() {
+        // The store holds four entries; the viewer cached the newest two,
+        // exactly as `recent(2)` would return.
+        let t0 = Utc::now();
+        let store = seq_entries(t0, 4);
+        let ds = MemoryLogDataSource::new()
+            .with_sources(vec![vhost_info("h")], vec![])
+            .with_entries("h", store.clone());
+        let mut v = viewer(ds);
+        v.init().await.unwrap();
+        // Same entries (ids included) as in the store, as `recent(2)`
+        // would return.
+        v.log_entries.insert("h".to_string(), store[2..].to_vec());
+
+        v.check_new_entries(&Source::vhost("h")).await.unwrap();
+
+        // Only the two genuinely-new entries are prepended; nothing that
+        // is already on screen is duplicated.
+        assert_eq!(
+            v.log_entries["h"]
+                .iter()
+                .map(|e| &e.message)
+                .collect::<Vec<_>>(),
+            ["entry 4", "entry 3", "entry 2", "entry 1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_new_entries_truncates_to_max_entries() {
+        let t0 = Utc::now();
+        let store = seq_entries(t0, 1060);
+        let ds = MemoryLogDataSource::new()
+            .with_sources(vec![vhost_info("h")], vec![])
+            .with_entries("h", store.clone());
+        let mut v = viewer(ds);
+        v.init().await.unwrap();
+        // The cache holds `entry 1000`..`entry 2` (999 entries), leaving
+        // room for 60 new ones to overflow the cap.
+        let mut cached = store;
+        cached.drain(0..60);
+        cached.pop();
+        v.log_entries.insert("h".to_string(), cached);
+
+        v.check_new_entries(&Source::vhost("h")).await.unwrap();
+
+        let entries = &v.log_entries["h"];
+        assert_eq!(entries.len(), MAX_ENTRIES_PER_HOST);
+        assert_eq!(entries[0].message, "entry 1060");
+        assert_eq!(entries[entries.len() - 1].message, "entry 61");
+    }
+
+    #[tokio::test]
+    async fn test_check_new_entries_is_noop_when_nothing_newer() {
+        let t0 = Utc::now();
+        let ds = MemoryLogDataSource::new()
+            .with_sources(vec![vhost_info("h")], vec![])
+            .with_entries("h", seq_entries(t0, 3));
+        let mut v = viewer(ds);
+        v.init().await.unwrap();
+
+        let before: Vec<String> = v.log_entries["h"]
+            .iter()
+            .map(|e| e.message.clone())
+            .collect();
+        v.check_new_entries(&Source::vhost("h")).await.unwrap();
+
+        let after: Vec<String> = v.log_entries["h"]
+            .iter()
+            .map(|e| e.message.clone())
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_switches_to_highlighted_source() {
+        let ds = MemoryLogDataSource::new()
+            .with_sources(
+                vec![vhost_info("a.example.com"), vhost_info("b.example.com")],
+                vec![],
+            )
+            .with_entries("a.example.com", vec![display_entry(1, Utc::now())])
+            .with_entries(
+                "b.example.com",
+                vec![display_entry(2, Utc::now()), display_entry(3, Utc::now())],
+            );
+        let mut v = viewer(ds);
+        v.init().await.unwrap();
+        assert_eq!(v.selected_source, Some(Source::vhost("a.example.com")));
+
+        // Highlight the second vhost (row 2) and refresh.
+        v.host_state.select(Some(2));
+        v.handle_action(&Action::Refresh).await.unwrap();
+
+        assert_eq!(v.selected_source, Some(Source::vhost("b.example.com")));
+        assert_eq!(
+            v.log_entries.get("b.example.com").map(Vec::len),
+            Some(2),
+            "refreshing loads the highlighted source's entries"
+        );
     }
 
     #[tokio::test]

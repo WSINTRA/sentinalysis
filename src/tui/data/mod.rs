@@ -76,8 +76,8 @@ pub trait LogDataSource: Send {
     ) -> BoxFuture<'_, Result<Vec<DisplayLogEntry>, SentinelError>>;
 
     /// Entries strictly newer than the `(since, since_id)` cursor, newest
-    /// first, up to `limit`. The cursor is the `(timestamp, id)` of the
-    /// oldest entry already on screen, so entries sharing a timestamp are
+    /// first, up to `limit`. Callers pass the `(timestamp, id)` of the
+    /// newest entry already on screen, so entries sharing a timestamp are
     /// neither missed nor duplicated.
     fn newer(
         &self,
