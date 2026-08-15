@@ -174,3 +174,154 @@ impl<D: LogDataSource> LogViewer<D> {
         Style::new().fg(base_color).add_modifier(modifier)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log_scanner::classifier::ThreatLevel;
+    use crate::log_scanner::parser::LogLevel;
+    use crate::log_scanner::source::SourceKind;
+    use crate::tui::components::Component;
+    use crate::tui::data::SourceInfo;
+    use crate::tui::data::memory::MemoryLogDataSource;
+    use chrono::Utc;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use uuid::Uuid;
+
+    type TestViewer = LogViewer<MemoryLogDataSource>;
+
+    fn entry(message: &str, threat: ThreatLevel, categories: Vec<String>) -> DisplayLogEntry {
+        DisplayLogEntry {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            level: LogLevel::Info,
+            threat_level: threat,
+            message: message.to_string(),
+            raw: String::new(),
+            source_name: "a.example.com".to_string(),
+            threat_categories: categories,
+        }
+    }
+
+    /// A viewer with one vhost (two entries, one a threat) and one system
+    /// log, initialised from the data source.
+    async fn viewer_with_sources() -> TestViewer {
+        let ds = MemoryLogDataSource::new()
+            .with_sources(
+                vec![SourceInfo::new(SourceKind::Vhost, "a.example.com", 2)],
+                vec![SourceInfo::new(SourceKind::SystemLog, "auth.log", 0)],
+            )
+            .with_entries(
+                "a.example.com",
+                vec![
+                    entry(
+                        "sql injection attempt",
+                        ThreatLevel::High,
+                        vec!["sql-injection".to_string()],
+                    ),
+                    entry("GET / 200", ThreatLevel::None, Vec::new()),
+                ],
+            );
+        let mut v = LogViewer::new(ds);
+        v.init().await.unwrap();
+        v
+    }
+
+    fn render_to_buffer(viewer: &mut TestViewer) -> Buffer {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| viewer.draw(frame, Rect::new(0, 0, 100, 30)))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let width = buffer.area.width as usize;
+        (0..buffer.area.height)
+            .map(|y| {
+                buffer
+                    .content()
+                    .iter()
+                    .skip((y as usize) * width)
+                    .take(width)
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn test_host_list_shows_headers_and_sources() {
+        let mut v = viewer_with_sources().await;
+        let text = buffer_text(&render_to_buffer(&mut v));
+
+        assert!(text.contains("Virtual Hosts"));
+        assert!(text.contains("[L] a.example.com"));
+        assert!(text.contains("System Logs"));
+        assert!(text.contains("[S] auth.log"));
+        assert!(text.contains("Sources"));
+    }
+
+    #[test]
+    fn test_empty_sources_show_notice() {
+        let mut v = LogViewer::new(MemoryLogDataSource::new());
+        let text = buffer_text(&render_to_buffer(&mut v));
+
+        assert!(text.contains("No log sources found"));
+    }
+
+    #[tokio::test]
+    async fn test_focus_border_is_cyan_on_focused_panel() {
+        // HostList is the default focus: the left border (x=0) is cyan.
+        let mut v = viewer_with_sources().await;
+        let buffer = render_to_buffer(&mut v);
+        assert_eq!(buffer.cell((0, 10)).unwrap().fg, Color::Cyan);
+
+        // Focusing the log panel dims the host list border.
+        v.focus = PanelFocus::LogList;
+        let buffer = render_to_buffer(&mut v);
+        assert_eq!(buffer.cell((0, 10)).unwrap().fg, Color::DarkGray);
+        // The log panel's left border (x=25) becomes cyan.
+        assert_eq!(buffer.cell((25, 10)).unwrap().fg, Color::Cyan);
+    }
+
+    #[tokio::test]
+    async fn test_log_list_title_and_entries() {
+        let mut v = viewer_with_sources().await;
+        let text = buffer_text(&render_to_buffer(&mut v));
+
+        assert!(text.contains("Logs: a.example.com"));
+        assert!(text.contains("sql injection attempt"));
+        assert!(text.contains("GET / 200"));
+        // Threats carry their category badge.
+        assert!(text.contains("[sql-injection]"));
+    }
+
+    #[tokio::test]
+    async fn test_filter_indicator_in_title() {
+        let mut v = viewer_with_sources().await;
+        v.filter_mode = true;
+        v.filter_text = "sql".to_string();
+
+        let text = buffer_text(&render_to_buffer(&mut v));
+
+        assert!(text.contains("[filter: 'sql']"));
+        // The non-matching entry is hidden.
+        assert!(text.contains("sql injection attempt"));
+        assert!(!text.contains("GET / 200"));
+    }
+
+    #[tokio::test]
+    async fn test_no_selection_shows_placeholder_title() {
+        let mut v = viewer_with_sources().await;
+        v.selected_source = None;
+
+        let text = buffer_text(&render_to_buffer(&mut v));
+
+        assert!(text.contains("No source selected"));
+    }
+}
