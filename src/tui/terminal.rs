@@ -123,11 +123,11 @@ impl Tui {
                 continue;
             };
 
-            if let Some(next_action) = app.handle_action(&action).await?
-                && next_action == Action::Quit
-            {
+            if action == Action::Quit {
                 break;
             }
+
+            app.handle_action(&action).await?;
         }
 
         Self::reset_terminal();

@@ -53,16 +53,24 @@ async fn run() -> Result<(), SentinelError> {
 
     if cli.tui {
         ensure_daemon_running(&cli.config).await?;
-        run_tui(pool).await
+        run_tui(pool, &config).await
     } else {
         run_daemon(pool, config).await
     }
 }
 
-async fn run_tui(pool: sqlx::PgPool) -> Result<(), SentinelError> {
+async fn run_tui(
+    pool: sqlx::PgPool,
+    config: &sentinel::config::Config,
+) -> Result<(), SentinelError> {
     info!("TUI mode starting");
 
-    let app = sentinel::tui::app::App::new(pool);
+    // The TUI lists the same sources the daemon tails, from the config.
+    let discovery =
+        sentinel::log_scanner::source_discovery::SourceDiscovery::from_config(&config.log_watching);
+    let data_source = sentinel::tui::data::pg::PgLogDataSource::new(pool, discovery);
+
+    let app = sentinel::tui::app::App::new(data_source);
     let mut tui = sentinel::tui::Tui::new()?;
 
     tui.run(app).await

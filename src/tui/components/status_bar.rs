@@ -41,8 +41,8 @@ impl Component for StatusBar {
     fn handle_action<'a>(
         &'a mut self,
         _action: &'a Action,
-    ) -> BoxedFuture<'a, Result<Option<Action>, SentinelError>> {
-        Box::pin(async { Ok(None) })
+    ) -> BoxedFuture<'a, Result<(), SentinelError>> {
+        Box::pin(async { Ok(()) })
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {

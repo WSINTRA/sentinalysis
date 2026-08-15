@@ -1,9 +1,13 @@
 //! TUI building blocks: the [`Component`] trait and the [`Composite`]
-//! container that runs a list of them in sequence.
+//! container that runs a list of them.
 //!
 //! `handle_action` is async on purpose: actions that need I/O (loading
 //! entries, polling for new ones) await it directly instead of blocking
 //! the runtime worker thread with `block_in_place`.
+//!
+//! Every component receives every action and decides for itself whether
+//! it cares; `Quit` is handled by the terminal event loop before
+//! dispatch, so components never see it.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -21,23 +25,20 @@ pub trait Component: Send {
         Box::pin(async { Ok(()) })
     }
 
-    /// Handle an action. Returns `Some(next)` to replace the action that
-    /// propagates to the remaining components (`None` = consumed).
-    ///
-    /// Both borrows share one lifetime so the returned future can outlive
-    /// neither `self` nor `action`.
+    /// Handle an action. Both borrows share one lifetime so the returned
+    /// future can outlive neither `self` nor `action`.
     fn handle_action<'a>(
         &'a mut self,
         action: &'a Action,
-    ) -> BoxedFuture<'a, Result<Option<Action>, SentinelError>>;
+    ) -> BoxedFuture<'a, Result<(), SentinelError>>;
 
     fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect);
 }
 
 pub type BoxedFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Runs a fixed set of components: actions propagate in order until one
-/// consumes them, and every component draws on every frame.
+/// Runs a fixed set of components: every action is sent to each
+/// component in order, and every component draws on every frame.
 pub struct Composite {
     components: Vec<Box<dyn Component>>,
 }
@@ -55,16 +56,11 @@ impl Composite {
         Ok(())
     }
 
-    pub async fn handle_action(
-        &mut self,
-        action: &Action,
-    ) -> Result<Option<Action>, SentinelError> {
+    pub async fn handle_action(&mut self, action: &Action) -> Result<(), SentinelError> {
         for component in &mut self.components {
-            if let Some(next_action) = component.handle_action(action).await? {
-                return Ok(Some(next_action));
-            }
+            component.handle_action(action).await?;
         }
-        Ok(None)
+        Ok(())
     }
 
     pub fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {

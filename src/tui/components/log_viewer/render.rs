@@ -11,11 +11,11 @@ use ratatui::widgets::{Block, Borders, List, ListItem};
 
 use crate::log_scanner::classifier::ThreatLevel;
 use crate::log_scanner::parser::LogLevel;
-use crate::tui::data::DisplayLogEntry;
+use crate::tui::data::{DisplayLogEntry, LogDataSource};
 
 use super::{LogViewer, PanelFocus};
 
-impl LogViewer {
+impl<D: LogDataSource> LogViewer<D> {
     pub(super) fn render(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let main_layout = Layout::default()
             .direction(Direction::Horizontal)
@@ -32,6 +32,9 @@ impl LogViewer {
         items.push(ListItem::new(
             Line::raw("Virtual Hosts").style(Style::new().add_modifier(Modifier::BOLD)),
         ));
+        if self.virtual_hosts.is_empty() && self.system_logs.is_empty() {
+            items.push(ListItem::new(Line::raw("No log sources found")));
+        }
         for h in &self.virtual_hosts {
             items.push(ListItem::new(Line::raw(format!("[L] {}", h.source.name))));
         }
