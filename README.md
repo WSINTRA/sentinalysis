@@ -4,16 +4,16 @@ Lightweight, secure server monitoring tool written in Rust.
 
 ## Features
 
-- **Log scanning**: Tail and parse nginx access/error logs and auth logs
+- **Log scanning**: Tail and parse nginx access logs and auth logs
 - **Per-vhost monitoring**: Automatic virtual host discovery from log filenames
-- **Journalctl tailing**: Tail systemd service logs (e.g., Python, Bun apps)
-- **Systemd service tracking**: Auto-discover and monitor user-created services
+- **TUI**: ratatui interface with sources panel, entry list, filtering, and threat badges
+- **Daemon mode**: Background scanner started on demand by the TUI (PID-file supervised)
 - **Threat detection**: SQL injection, XSS, path traversal, command injection, brute force, scanner UAs
-- **Noise filtering**: Exclude health checks, aggregate static assets and known bots
+- **Noise filtering**: Health checks and static assets stored as noise, known bots excluded
 - **File watching**: Cross-platform log tailing via `notify` (inotify/FSEvents)
 - **Log rotation aware**: Handles numeric suffix rotation (e.g., `access.log.1`)
-- **Postgres storage**: Batch inserts, configurable retention
-- **Secure by default**: Localhost-only API, TLS, API key auth (planned)
+- **Postgres storage**: Batch inserts, retention-ready schema
+- **Planned**: journalctl tailing, systemd service tracking, REST API, alerting
 
 ## Quick Start
 
@@ -25,16 +25,23 @@ cargo build --release
 cargo test
 
 # Lint
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo fmt
 
 # Run migrations
 DATABASE_URL=postgresql://user:pass@localhost/sentinel cargo sqlx migrate run
+
+# Run the TUI (starts the daemon if it is not running)
+DATABASE_URL=postgresql://user:pass@localhost/sentinel cargo run -- --tui
+
+# Run the daemon in the foreground
+DATABASE_URL=postgresql://user:pass@localhost/sentinel cargo run -- --daemon
 ```
 
 ## Configuration
 
-Sentinel uses a YAML config file (path via `SENTINEL_CONFIG` env var):
+Sentinel uses a YAML config file (path via `--config`, default `config.yaml`;
+missing files fall back to built-in defaults):
 
 ```yaml
 log_watching:
@@ -102,7 +109,10 @@ server {
 - Access logs: `<vhost>-access.log` (e.g., `api.example.com-access.log`)
 - Error logs: `<vhost>-error.log` (e.g., `api.example.com-error.log`)
 
-Sentinel discovers vhosts by scanning configured directories for `*.log` files and extracts the vhost from the `$host` field in logs.
+Sentinel discovers vhosts by scanning configured directories for files named
+`<vhost>-access.log` (matching the configured glob pattern) and ignores
+rotated files. The same discovery feeds the daemon's tailer and the TUI's
+sources panel.
 
 ### Log Rotation
 
@@ -126,8 +136,9 @@ Use standard logrotate with numeric suffixes:
 
 Sentinel ignores rotated files (e.g., `*.log.1`, `*.log.2`) and auto-discovers new files.
 
-## Systemd Service Tracking
+## Systemd Service Tracking (planned)
 
+Implemented in `src/service_tracker/` but not yet wired into the daemon.
 Sentinel auto-discovers systemd services from configured paths:
 
 - `/etc/systemd/system` — user-created (custom) services
@@ -139,9 +150,11 @@ For each service, it tracks via `systemctl show`:
 - CPU usage (`CPUUsageNSec`)
 - Restart count (`NRestart`)
 
-## Journalctl Tailing
+## Journalctl Tailing (planned)
 
-For services that log to journald (e.g., Python apps, Bun runtime), enable journalctl tailing:
+Implemented in `src/service_tracker/journalctl.rs` (via the `sdjournal`
+crate) but not yet wired into the daemon. For services that log to
+journald (e.g., Python apps, Bun runtime), enable journalctl tailing:
 
 ```yaml
 journalctl:
@@ -165,11 +178,9 @@ cargo sqlx migrate run
 ### Schema
 
 - `services` — vhosts and systemd services, log paths, virtual_host
-- `log_entries` — parsed log lines, linked to service, noise flag
-- `system_metrics` — CPU, memory, disk, network metrics
-- `active_sessions` — SSH/console sessions
-- `alerts` — triggered alert rules
-- `api_keys` — API authentication keys
+- `log_entries` — parsed log lines, linked to service, noise flag, threat level
+- `system_metrics`, `active_sessions`, `alerts`, `api_keys` — defined for the
+  planned system-monitoring, alerting, and API phases
 
 Raw log lines are stored only for non-noise entries to save space.
 
@@ -177,27 +188,41 @@ Raw log lines are stored only for non-noise entries to save space.
 
 ```
 src/
+├── main.rs               # CLI: TUI or daemon mode
 ├── config.rs             # YAML configuration loading
 ├── error.rs              # Centralized error types
+├── setup.rs              # Tracing init, config loading
+├── daemon/               # Daemon mode
+│   ├── process.rs        # PID file, liveness checks, child spawning
+│   └── run.rs            # Tailer → scanner loop, shutdown handling
 ├── db/                   # Database layer (sqlx/Postgres)
-│   ├── models.rs         # Query structs
+│   ├── models.rs         # Row and insert models
 │   ├── pool.rs           # Connection pool
-│   └── repositories/     # CRUD operations
+│   └── repositories/     # Write, viewer query, and service repos
 │       ├── log_entry_repo.rs
+│       ├── log_query_repo.rs
 │       └── service_repo.rs
-├── log_scanner/          # Log parsing, filtering, classification, tailing
+├── log_scanner/          # Tailing, parsing, filtering, classification
+│   ├── source.rs         # Source/SourceKind model, path helpers
+│   ├── source_discovery.rs # Config → discovered sources
 │   ├── parser/           # NginxAccessParser, AuthLogParser
-│   ├── filter.rs         # NoiseFilter with security detection
-│   ├── classifier.rs     # Threat classification
-│   ├── tailer.rs         # FileTailer with notify-based watching
-│   └── scanner.rs        # Orchestrator: tail→parse→filter→classify→store
-├── service_tracker/      # Systemd service tracking
+│   ├── filter.rs         # NoiseFilter (health checks, assets, bots)
+│   ├── classifier/       # Threat classification (patterns)
+│   ├── pipeline.rs       # Per-line: parse → filter → classify
+│   ├── scanner.rs        # Batching: stream → pipeline → repository
+│   └── tailer/           # FileTailer (notify-based, rotation aware)
+├── service_tracker/      # Systemd tracking, not yet wired
 │   ├── discoverer.rs     # Auto-discover services from systemd paths
-│   ├── monitor.rs        # systemctl show for status and resource usage
-│   └── journalctl.rs     # Tail journalctl for specific services
-├── api/                  # REST API (actix-web) - in progress
-├── alerting/             # Alert rules and evaluation - in progress
-└── system_monitor/       # System metrics collection - in progress
+│   ├── monitor.rs        # systemctl show for status and resources
+│   └── journalctl.rs     # sdjournal tailing for specific services
+└── tui/                  # ratatui terminal interface
+    ├── terminal.rs       # Event loop, key handling
+    ├── app.rs            # Component composition root
+    ├── action.rs         # Key → Action mapping
+    ├── data/             # LogDataSource trait + pg/memory impls
+    └── components/
+        ├── log_viewer/   # Two-panel viewer (state + rendering)
+        └── status_bar.rs # Key hints and transient messages
 ```
 
 ## Documentation
@@ -209,7 +234,9 @@ src/
 
 ## Tech Stack
 
-Rust 2024, tokio, actix-web, sqlx (Postgres), rustls, sysinfo, notify, crossbeam-channel
+Rust 2024, tokio, sqlx (Postgres), ratatui, crossterm, notify, sdjournal,
+tracing. (actix-web, rustls, sysinfo are declared for the planned API,
+alerting, and system-monitoring phases.)
 
 ## License
 

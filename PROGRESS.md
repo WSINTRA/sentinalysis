@@ -1,45 +1,34 @@
 # PROGRESS.md - Sentinel Development Progress
 
-## Status: Phases 1, 2, 2b, 4 Complete
+## Status: Core monitoring loop, TUI, and daemon complete
 
 ### Completed
 
-- [x] Project documentation created (SPEC.md, PLAN.md, AGENT.md, PROGRESS.md, README.md)
-- [x] Rust project initialized with cargo
-- [x] Dependencies configured in Cargo.toml
-- [x] Git repository initialized
-- [x] Project structure created
-- [x] Error types implementation (src/error.rs) - 9 tests
-- [x] LogParser trait and types (src/log_scanner/parser/mod.rs)
-- [x] NginxAccessParser (src/log_scanner/parser/nginx.rs) - 25 tests (custom format with $host/$request_time)
-- [x] AuthLogParser (src/log_scanner/parser/auth.rs) - 14 tests
-- [x] NoiseFilter with security detection (src/log_scanner/filter.rs) - 27 tests
-- [x] Threat Classifier (src/log_scanner/classifier.rs) - 38 tests
-- [x] FileTailer with notify-based watching (src/log_scanner/tailer.rs) - 11 tests (2-channel design)
-- [x] Scanner orchestrator (src/log_scanner/scanner.rs) - tail→parse→filter→classify→batch insert
-- [x] Configuration loading (src/config.rs) - YAML with serde defaults
-- [x] Database pool setup (src/db/pool.rs) - PgPool from DATABASE_URL
-- [x] SQL migrations (migrations/20260810204714_initial_schema.sql) - full schema with indexes
-- [x] DB models (src/db/models.rs) - query structs for all 6 tables
-- [x] LogEntry repository (src/db/repositories/log_entry_repo.rs) - batch insert, raw_line for non-noise only
-- [x] Service repository (src/db/repositories/service_repo.rs) - CRUD, get_or_create, find_by_virtual_host
-- [x] ServiceDiscoverer (src/service_tracker/discoverer.rs) - systemd paths, user-created vs system classification
-- [x] ServiceMonitor (src/service_tracker/monitor.rs) - systemctl show for ActiveState, MemoryCurrent, CPUUsageNSec, NRestart
-- [x] JournalctlTailer (src/service_tracker/journalctl.rs) - sdjournal crate, LiveJournal with LiveSubscription
-
-### In Progress
-
-- [ ] System monitor (src/system_monitor/) - CPU, memory, disk, network metrics
-- [ ] Alerting engine (src/alerting/) - rules, evaluation
-- [ ] API layer (src/api/) - actix-web, TLS, auth, rate limiting
+- [x] Project documentation (SPEC.md, PLAN.md, AGENT.md, PROGRESS.md, README.md)
+- [x] Error types (src/error.rs), configuration loading (src/config.rs)
+- [x] Parsers: NginxAccessParser, AuthLogParser (src/log_scanner/parser/)
+- [x] NoiseFilter: health checks, static assets, known bots (src/log_scanner/filter.rs)
+- [x] Threat classifier: SQLi, XSS, path traversal, command injection, brute force, scanner UAs
+- [x] FileTailer: notify-based watching, rotation aware (src/log_scanner/tailer/)
+- [x] Source/SourceKind model + config-driven SourceDiscovery (shared by daemon and TUI)
+- [x] Pipeline: per-line parse → filter → classify, honoring noise/security semantics
+- [x] Scanner: batched stream → pipeline → repository (src/log_scanner/scanner.rs)
+- [x] Postgres: migrations, pool, write/query/service repositories (src/db/)
+- [x] Daemon mode: PID-file supervision, config forwarding, SIGTERM/SIGINT shutdown (src/daemon/)
+- [x] TUI: ratatui two-panel log viewer, filtering, threat badges, status bar (src/tui/)
+- [x] TUI data layer: LogDataSource trait with Postgres and in-memory implementations
+- [x] Test suite: 261 passing (4 ignored on macOS FSEvents), incl. end-to-end pipeline
+  integration test, TestBackend render tests, and in-memory viewer behavior tests
+- [x] CI: GitHub Actions running fmt, clippy (-D warnings), and tests
+- [x] Service tracker implementation (discoverer, monitor, sdjournal tailer) —
+  built and tested, not yet wired into the daemon
 
 ### Next Steps
 
-1. Implement system_monitor module (metric collection via sysinfo, session tracking)
-2. Implement alerting engine (alert rules, evaluation, notification)
-3. Implement API layer (routes, TLS, API key auth, rate limiting)
-4. Wire up main.rs with DI and graceful shutdown
-5. Full integration tests
+1. Wire service_tracker (discoverer + monitor + journalctl tailer) into the daemon
+2. System monitor module (CPU, memory, disk, network via sysinfo)
+3. Alerting engine (rules, evaluation, notification)
+4. API layer (actix-web, TLS, API key auth, rate limiting)
 
 ### Blockers
 
@@ -47,10 +36,11 @@ None.
 
 ### Notes
 
-- 185 tests passing total (4 ignored: macOS FSEvents)
-- Clippy clean, rustfmt applied
-- TDD workflow established: tests first, clippy/fmt on every commit
-- FileTailer uses crossbeam-channel for thread-safe notify bridging
-- Scanner batch inserts every 100 entries or 1 second
-- JournalctlTailer uses sdjournal crate (v0.1.15) for native journal reading
-- README updated with nginx setup, systemd tracking, journalctl tailing docs
+- 261 tests passing (4 ignored: macOS FSEvents live-append tests)
+- Clippy clean with `-D warnings`, rustfmt applied on every commit
+- TDD workflow: tests first, `cargo fmt && cargo clippy --all-targets -- -D warnings
+  && cargo test` green on every commit
+- TUI polls the database at most every 2 s per selected source; the poll cursor
+  is the newest on-screen entry (strict `(timestamp, id)` row-value comparison)
+- Daemon is started on demand by the TUI; `SENTINEL_PID_FILE` overrides the
+  default PID file location (/run/sentinel.pid)
