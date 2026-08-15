@@ -19,6 +19,7 @@ use tracing::warn;
 
 use super::{LogWatchConfig, TailEvent, TailLine};
 use crate::error::SentinelError;
+use crate::log_scanner::source::is_rotated_log;
 
 /// Resumable reading state for the files and directories being tailed.
 pub struct TailerState {
@@ -179,17 +180,6 @@ impl TailerState {
     }
 }
 
-/// A rotated log has a purely numeric suffix: `access.log.1`. Gzipped
-/// rotations (`access.log.1.gz`) are not tailed.
-fn is_rotated_log(file_name: &str) -> bool {
-    if let Some(dot_pos) = file_name.rfind('.') {
-        let suffix = &file_name[dot_pos + 1..];
-        !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
-    } else {
-        false
-    }
-}
-
 /// Glob match against the file name only (never the directory part).
 fn matches_pattern(path: &Path, pattern: &Pattern) -> bool {
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
@@ -232,28 +222,6 @@ fn find_matching_config<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_rotated_log_detects_numeric_suffix() {
-        assert!(is_rotated_log("access.log.1"));
-        assert!(is_rotated_log("access.log.2"));
-        assert!(is_rotated_log("example.com-access.log.10"));
-        assert!(is_rotated_log("error.log.99"));
-    }
-
-    #[test]
-    fn test_is_rotated_log_ignores_normal_logs() {
-        assert!(!is_rotated_log("access.log"));
-        assert!(!is_rotated_log("error.log"));
-        assert!(!is_rotated_log("example.com-access.log"));
-        assert!(!is_rotated_log("auth.log"));
-    }
-
-    #[test]
-    fn test_is_rotated_log_ignores_gzipped() {
-        assert!(!is_rotated_log("access.log.1.gz"));
-        assert!(!is_rotated_log("error.log.2.gz"));
-    }
 
     #[test]
     fn test_matches_pattern_with_log_pattern() {

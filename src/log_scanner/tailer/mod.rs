@@ -55,12 +55,15 @@ impl LogWatchConfig {
 }
 
 /// Watches log files/directories and emits their new lines.
+///
+/// Constructing a `FileTailer` is cheap and synchronous; the tokio
+/// runtime handle is captured in [`Self::start`], so building one
+/// outside a runtime (e.g. in a unit test) is fine.
 pub struct FileTailer {
     /// Kept alive for the process lifetime; dropping it stops the watch.
     watcher: Option<RecommendedWatcher>,
     files: Vec<PathBuf>,
     watch_configs: Vec<LogWatchConfig>,
-    rt: tokio::runtime::Handle,
     cancel_token: CancellationToken,
     started: bool,
 }
@@ -71,7 +74,6 @@ impl Default for FileTailer {
             watcher: None,
             files: Vec::new(),
             watch_configs: Vec::new(),
-            rt: tokio::runtime::Handle::current(),
             cancel_token: CancellationToken::new(),
             started: false,
         }
@@ -164,7 +166,7 @@ impl FileTailer {
 
         // Bridge: notify handler thread (sync) → tokio task (async).
         let (event_tx, mut event_rx) = mpsc::channel::<notify::Result<Event>>(128);
-        let rt = self.rt.clone();
+        let rt = tokio::runtime::Handle::current();
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
                 while let Ok(event) = notify_rx.recv() {

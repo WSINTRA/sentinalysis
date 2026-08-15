@@ -62,6 +62,34 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+impl LogLevel {
+    /// The lowercase name stored in `log_entries.level`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+            LogLevel::Critical => "critical",
+            LogLevel::Security => "security",
+        }
+    }
+
+    /// Parse a stored level; unknown values map to [`LogLevel::Info`].
+    #[must_use]
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "debug" => LogLevel::Debug,
+            "warn" => LogLevel::Warn,
+            "error" => LogLevel::Error,
+            "critical" => LogLevel::Critical,
+            "security" => LogLevel::Security,
+            _ => LogLevel::Info,
+        }
+    }
+}
+
 pub trait LogParser: Send + Sync {
     fn parse(&self, line: &str) -> Result<Option<ParsedLogEntry>, ParseError>;
     fn name(&self) -> &str;

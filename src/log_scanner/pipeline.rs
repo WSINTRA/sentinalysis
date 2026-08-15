@@ -25,6 +25,7 @@ use crate::log_scanner::filter::{FilterResult, NoiseFilter};
 use crate::log_scanner::parser::auth::AuthLogParser;
 use crate::log_scanner::parser::nginx::NginxAccessParser;
 use crate::log_scanner::parser::{LogLevel, LogParser};
+use crate::log_scanner::source::vhost_from_file_path;
 use crate::log_scanner::tailer::TailLine;
 
 /// A boxed, send, lifetime-bound future.
@@ -276,7 +277,7 @@ impl Pipeline {
                 _ => None,
             };
 
-            let virtual_host = Self::extract_vhost_from_file_path(&line.file_path)
+            let virtual_host = vhost_from_file_path(&line.file_path)
                 .or_else(|| entry.metadata.virtual_host.clone());
 
             let service_id = if let Some(vhost) = &virtual_host {
@@ -300,7 +301,7 @@ impl Pipeline {
             Ok(Some(InsertLogEntry {
                 service_id,
                 timestamp: entry.timestamp,
-                level,
+                level: level.as_str().to_string(),
                 message: entry.message,
                 raw_line: if is_noise { None } else { Some(entry.raw) },
                 client_ip: entry.metadata.client_ip.map(|ip| ip.to_string()),
@@ -319,34 +320,15 @@ impl Pipeline {
         })
     }
 
-    /// Derive the virtual host from an nginx vhost access-log file name
-    /// (`<vhost>-access.log` → `<vhost>`).
-    #[must_use]
-    pub fn extract_vhost_from_file_path(file_path: &Path) -> Option<String> {
-        file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|name| name.ends_with("-access.log"))
-            .map(|name| name.trim_end_matches("-access.log").to_string())
-    }
-
-    /// Map a parser level plus threat result to the stored level string.
+    /// Map a parser level plus threat result to the stored level.
     /// High/Critical threats are stored as `security` regardless of the
     /// base level.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    pub fn classify_level(base_level: LogLevel, threat: &ThreatResult) -> String {
+    pub fn classify_level(base_level: LogLevel, threat: &ThreatResult) -> LogLevel {
         if threat.threat_level >= ThreatLevel::High {
-            return "security".to_string();
-        }
-
-        match base_level {
-            LogLevel::Debug => "debug".to_string(),
-            LogLevel::Info => "info".to_string(),
-            LogLevel::Warn => "warn".to_string(),
-            LogLevel::Error => "error".to_string(),
-            LogLevel::Critical => "critical".to_string(),
-            LogLevel::Security => "security".to_string(),
+            LogLevel::Security
+        } else {
+            base_level
         }
     }
 }
@@ -492,26 +474,6 @@ mod tests {
         assert_eq!(first, services.id_of("svc"));
     }
 
-    #[test]
-    fn test_extract_vhost_from_file_path() {
-        assert_eq!(
-            Pipeline::extract_vhost_from_file_path(Path::new(
-                "/var/log/nginx/api.example.com-access.log"
-            )),
-            Some("api.example.com".to_string())
-        );
-        assert_eq!(
-            Pipeline::extract_vhost_from_file_path(Path::new("/var/log/nginx/access.log")),
-            None
-        );
-        assert_eq!(
-            Pipeline::extract_vhost_from_file_path(Path::new(
-                "/var/log/nginx/app.example.com-access.log.1"
-            )),
-            None
-        );
-    }
-
     /// `build_pipeline` must produce a working pipeline even when the
     /// database is unreachable: the entry is still stored, just without a
     /// service link.
@@ -553,7 +515,7 @@ mod tests {
         };
         assert_eq!(
             Pipeline::classify_level(LogLevel::Info, &threat),
-            "security"
+            LogLevel::Security
         );
     }
 
@@ -564,11 +526,35 @@ mod tests {
             categories: vec![],
             confidence: 0.0,
         };
-        assert_eq!(Pipeline::classify_level(LogLevel::Info, &threat), "info");
-        assert_eq!(Pipeline::classify_level(LogLevel::Error, &threat), "error");
+        assert_eq!(
+            Pipeline::classify_level(LogLevel::Info, &threat),
+            LogLevel::Info
+        );
+        assert_eq!(
+            Pipeline::classify_level(LogLevel::Error, &threat),
+            LogLevel::Error
+        );
         assert_eq!(
             Pipeline::classify_level(LogLevel::Security, &threat),
-            "security"
+            LogLevel::Security
         );
+    }
+
+    /// `as_str` → `from_db` must round-trip for every level, and unknown
+    /// stored values must fall back to `Info`.
+    #[test]
+    fn test_log_level_db_roundtrip() {
+        for level in [
+            LogLevel::Debug,
+            LogLevel::Info,
+            LogLevel::Warn,
+            LogLevel::Error,
+            LogLevel::Critical,
+            LogLevel::Security,
+        ] {
+            assert_eq!(LogLevel::from_db(level.as_str()), level);
+        }
+        assert_eq!(LogLevel::from_db("bogus"), LogLevel::Info);
+        assert_eq!(LogLevel::from_db(""), LogLevel::Info);
     }
 }

@@ -1,5 +1,6 @@
 //! Tail systemd journal output for the configured services.
 use std::thread;
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender, bounded};
 use sdjournal::Journal;
@@ -111,6 +112,23 @@ fn normalize_unit(service: &str) -> String {
     }
 }
 
+/// Join a thread, waiting at most `timeout`. Returns whether the thread
+/// finished within the deadline — a stuck journal read must not hang
+/// shutdown.
+fn join_bounded(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The thread has exited (possibly with a panic); `join` now returns
+    // immediately, so any panic is re-raised to the caller.
+    let _ = handle.join();
+    true
+}
+
 async fn consume_subscription(
     service: &str,
     sub: sdjournal::LiveSubscription,
@@ -150,7 +168,7 @@ async fn consume_subscription(
 
                 Ok(Err(e)) => {
                     warn!("journal read error for '{service_name}': {e}");
-                    thread::sleep(std::time::Duration::from_secs(1));
+                    thread::sleep(Duration::from_secs(1));
                 }
 
                 Err(_) => {
@@ -175,14 +193,22 @@ async fn consume_subscription(
         biased;
 
         () = cancel.cancelled() => {
-            let _ = read_handle.join();
+            if !join_bounded(read_handle, Duration::from_secs(5)) {
+                warn!(
+                    "journal read thread for '{service}' did not exit in time; abandoning it"
+                );
+            }
             bridge_handle.abort();
             info!("journal tailer stopped for '{service}'");
             Ok(())
         }
 
         _ = (&mut bridge_handle) => {
-            let _ = read_handle.join();
+            if !join_bounded(read_handle, Duration::from_secs(5)) {
+                warn!(
+                    "journal read thread for '{service}' did not exit in time; abandoning it"
+                );
+            }
             Err(SentinelError::ServiceError(
                 "journal bridge channel closed".into(),
             ))
@@ -243,5 +269,23 @@ mod tests {
     #[test]
     fn test_normalize_unit_without_suffix() {
         assert_eq!(normalize_unit("my-app"), "my-app.service");
+    }
+
+    #[test]
+    fn test_join_bounded_returns_when_thread_finishes() {
+        let handle = thread::spawn(|| thread::sleep(Duration::from_millis(20)));
+        assert!(join_bounded(handle, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn test_join_bounded_gives_up_on_stuck_thread() {
+        let handle = thread::spawn(|| thread::sleep(Duration::from_secs(5)));
+        let started = std::time::Instant::now();
+        assert!(!join_bounded(handle, Duration::from_millis(100)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "must not block on the stuck thread"
+        );
+        // The stuck thread is abandoned (it sleeps, then exits harmlessly).
     }
 }

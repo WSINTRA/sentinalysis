@@ -52,7 +52,7 @@ async fn run() -> Result<(), SentinelError> {
     );
 
     if cli.tui {
-        ensure_daemon_running().await?;
+        ensure_daemon_running(&cli.config).await?;
         run_tui(pool).await
     } else {
         run_daemon(pool, config).await

@@ -10,4 +10,5 @@ pub mod filter;
 pub mod parser;
 pub mod pipeline;
 pub mod scanner;
+pub mod source;
 pub mod tailer;

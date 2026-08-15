@@ -218,14 +218,7 @@ impl LogViewer {
     /// Map a database row to the display model.
     #[must_use]
     pub fn row_to_display(row: LogEntryRow) -> DisplayLogEntry {
-        let level = match row.level.as_str() {
-            "debug" => LogLevel::Debug,
-            "warn" => LogLevel::Warn,
-            "error" => LogLevel::Error,
-            "critical" => LogLevel::Critical,
-            "security" => LogLevel::Security,
-            _ => LogLevel::Info,
-        };
+        let level = LogLevel::from_db(&row.level);
 
         DisplayLogEntry {
             id: row.id,
