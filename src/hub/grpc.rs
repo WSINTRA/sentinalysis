@@ -46,6 +46,8 @@ impl IngestService {
 
     /// Authenticates the request: extracts `x-api-key` metadata, applies
     /// the per-IP attempt budget, then verifies the key.
+    // `tonic::Status` is the required error type of the handler trait.
+    #[allow(unknown_lints, clippy::result_large_err)]
     async fn authorize(
         &self,
         request: &Request<impl std::fmt::Debug>,

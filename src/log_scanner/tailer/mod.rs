@@ -129,7 +129,12 @@ impl FileTailer {
     ///
     /// Initial content of all watched files/directories is read before
     /// the first live event is delivered.
-    #[allow(clippy::unused_async, clippy::too_many_lines)]
+    #[allow(
+        unknown_lints,
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        clippy::too_many_lines
+    )]
     pub async fn start(&mut self) -> Result<TokioReceiver<TailEvent>, SentinelError> {
         if self.started {
             return Err(SentinelError::Internal("Tailer already started".into()));

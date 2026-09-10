@@ -222,6 +222,9 @@ impl HubClient {
     ///
     /// # Errors
     /// gRPC failure.
+    // tonic::Status is a fixed-size type imposed by the client API; the
+    // lint's boxing suggestion would only complicate call sites.
+    #[allow(unknown_lints, clippy::result_large_err)]
     pub async fn send_metrics(&mut self, point: MetricPoint) -> Result<(), tonic::Status> {
         let mut request = tonic::Request::new(MetricsRequest { point: Some(point) });
         request
@@ -234,6 +237,7 @@ impl HubClient {
     ///
     /// # Errors
     /// gRPC failure.
+    #[allow(unknown_lints, clippy::result_large_err)]
     pub async fn send_logs(&mut self, lines: Vec<LogLine>) -> Result<(), tonic::Status> {
         let mut request = tonic::Request::new(LogsRequest { lines });
         request
