@@ -12,6 +12,7 @@ futures = "0.3"
 # Web framework
 actix-web = { version = "4", features = ["rustls-0_23"] }
 actix-tls = { version = "3", features = ["rustls-0_23"] }
+actix-files = "0.6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -67,6 +68,18 @@ governor = "0.8"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
+# gRPC (hub + agent)
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+# Key-ID derivation (fast lookup before argon2)
+sha2 = "0.10"
+
+# Random key generation
+rand = "0.8"
+base64 = "0.22"
+
 # Environment variables
 dotenvy = "0.15"
 
@@ -81,9 +94,18 @@ rstest = "0.24"
 proptest = "1"
 tempfile = "3"
 
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
+
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# Byte-counters and serialized sizes are genuinely safe to narrow in every
+# realistic value here; the conversions are deliberate.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"

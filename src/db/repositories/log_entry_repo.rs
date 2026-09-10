@@ -12,6 +12,7 @@ use crate::error::SentinelError;
 const INSERT_PREFIX: &str = "INSERT INTO log_entries (service_id, timestamp, level, message, raw_line, client_ip, request_path, status_code, response_time_ms, is_noise, noise_reason, threat_level, threat_categories)";
 
 /// Persistence for `log_entries`.
+#[derive(Clone)]
 pub struct LogEntryRepository {
     pool: PgPool,
 }
@@ -63,6 +64,27 @@ pub(crate) fn build_insert_query(entries: &[InsertLogEntry]) -> QueryBuilder<'_,
     });
 
     query
+}
+
+/// Deletes log entries older than the retention window, in bounded batches.
+/// Returns rows deleted. Free function: the hub's retention loop uses it
+/// without holding a repository instance.
+///
+/// # Errors
+/// Database failure.
+pub async fn prune_log_entries(pool: &PgPool, keep_days: u32) -> Result<u64, SentinelError> {
+    let result = sqlx::query(
+        r"DELETE FROM log_entries
+          WHERE id IN (
+              SELECT id FROM log_entries
+              WHERE timestamp < NOW() - make_interval(days => $1)
+              LIMIT 10000
+          )",
+    )
+    .bind(keep_days.cast_signed())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 #[cfg(test)]

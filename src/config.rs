@@ -5,7 +5,7 @@
 //! per-section defaults.
 
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use crate::error::SentinelError;
@@ -19,6 +19,8 @@ pub struct Config {
     pub noise_filter: NoiseFilterConfig,
     pub service_tracker: ServiceTrackerConfig,
     pub journalctl: JournalctlConfig,
+    pub hub: HubConfig,
+    pub agent: AgentConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +121,157 @@ pub struct ServiceOverrideConfig {
 pub struct JournalctlConfig {
     pub enabled: bool,
     pub services: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HubConfig {
+    pub enabled: bool,
+    pub grpc_host: String,
+    pub grpc_port: u16,
+    pub rest_host: String,
+    pub rest_port: u16,
+    pub spa_path: PathBuf,
+    pub tls: TlsConfig,
+    /// Non-empty restricts `event_type` values to this allowlist.
+    pub allowed_event_types: Vec<String>,
+    /// Retention window for `app_events` / `log_entries` (days; 0 disables).
+    pub retention_days: u32,
+    /// Retention window for `system_metrics` (days; 0 disables).
+    pub metrics_retention_days: u32,
+}
+
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            grpc_host: "127.0.0.1".into(),
+            grpc_port: 50051,
+            rest_host: "127.0.0.1".into(),
+            rest_port: 8080,
+            spa_path: PathBuf::from("./web/dist"),
+            tls: TlsConfig::default(),
+            allowed_event_types: vec![],
+            retention_days: 90,
+            metrics_retention_days: 30,
+        }
+    }
+}
+
+impl HubConfig {
+    fn parse_host(host: &str) -> Option<IpAddr> {
+        if host == "localhost" {
+            return Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        }
+        host.parse::<IpAddr>().ok()
+    }
+
+    fn is_tailscale(ip: IpAddr) -> bool {
+        // CGNAT 100.64.0.0/10 — the range Tailscale assigns. (`Ipv4Addr::
+        // is_shared` covers this but is still nightly-gated.)
+        matches!(ip, IpAddr::V4(v4) if {
+            let [o1, o2, ..] = v4.octets();
+            o1 == 100 && (64..=127).contains(&o2)
+        })
+    }
+
+    /// Startup guard for plaintext exposure:
+    /// - loopback bind: fine.
+    /// - Tailscale (CGNAT `100.64/10`) bind without TLS: allowed (`WireGuard`
+    ///   encrypts), but a loud warning is logged so the choice is visible.
+    /// - any other non-loopback bind without TLS: refused — an accidental
+    ///   public plaintext exposure is exactly what this guard exists for.
+    ///
+    /// # Errors
+    /// `ConfigError` when a public bind would run without TLS.
+    pub fn validate_bind_security(&self) -> Result<(), SentinelError> {
+        if self.tls.enabled {
+            return Ok(());
+        }
+        let mut warned = false;
+        for (name, host) in [
+            ("grpc_host", &self.grpc_host),
+            ("rest_host", &self.rest_host),
+        ] {
+            let Some(ip) = Self::parse_host(host) else {
+                // Unparseable host (e.g. a DNS name): allow only if it is
+                // obviously loopback-ish; otherwise refuse without TLS.
+                if host != "localhost" {
+                    return Err(SentinelError::ConfigError(format!(
+                        "hub {name} '{host}' is not an IP or 'localhost'; refusing to bind \
+                         without TLS (set hub.tls.enabled or use 127.0.0.1)"
+                    )));
+                }
+                continue;
+            };
+            if ip.is_loopback() {
+                continue;
+            }
+            if Self::is_tailscale(ip) {
+                tracing::warn!(
+                    host = %host,
+                    "hub {name} is a Tailscale address without TLS; transport is encrypted \
+                     by WireGuard, but consider enabling hub.tls.enabled for defense in depth"
+                );
+                warned = true;
+            } else {
+                return Err(SentinelError::ConfigError(format!(
+                    "hub {name} '{host}' is a public address but hub.tls.enabled is false; \
+                     keys and payloads would travel in plaintext"
+                )));
+            }
+        }
+        if warned {
+            tracing::warn!(
+                "hub running without TLS on a Tailscale interface — acceptable per config, \
+                 review if this is unintended"
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TlsConfig {
+    pub enabled: bool,
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub enabled: bool,
+    pub hub_addr: String,
+    /// Raw API key (`snt_...`), or a path loaded via `SENTINEL_API_KEY_FILE`.
+    pub api_key: String,
+    /// Docker container names to tail.
+    pub containers: Vec<String>,
+    pub metrics_interval_secs: u64,
+    pub log_batch_size: usize,
+    pub log_flush_interval_secs: u64,
+    /// Bounded in-memory log buffer; oldest lines drop on overflow.
+    pub log_buffer_max: usize,
+    pub connect_timeout_secs: u64,
+    /// Final flush deadline on shutdown.
+    pub flush_timeout_secs: u64,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hub_addr: "127.0.0.1:50051".into(),
+            api_key: String::new(),
+            containers: vec!["app".into()],
+            metrics_interval_secs: 30,
+            log_batch_size: 100,
+            log_flush_interval_secs: 5,
+            log_buffer_max: 10_000,
+            connect_timeout_secs: 10,
+            flush_timeout_secs: 5,
+        }
+    }
 }
 
 impl Config {
@@ -278,5 +431,92 @@ journalctl:
         let config = Config::load(file.path().to_str().unwrap()).unwrap();
         assert_eq!(config.service_tracker.services.len(), 1);
         assert_eq!(config.service_tracker.services[0].name, "my-python-app");
+    }
+
+    // ---- Hub bind-security guard ----
+
+    #[test]
+    fn test_hub_guard_loopback_ok() {
+        HubConfig::default().validate_bind_security().unwrap();
+    }
+
+    #[test]
+    fn test_hub_guard_localhost_string_ok() {
+        let config = HubConfig {
+            grpc_host: "localhost".into(),
+            rest_host: "localhost".into(),
+            ..HubConfig::default()
+        };
+        config.validate_bind_security().unwrap();
+    }
+
+    #[test]
+    fn test_hub_guard_tls_anywhere_ok() {
+        let config = HubConfig {
+            grpc_host: "0.0.0.0".into(),
+            rest_host: "0.0.0.0".into(),
+            tls: TlsConfig {
+                enabled: true,
+                ..TlsConfig::default()
+            },
+            ..HubConfig::default()
+        };
+        config.validate_bind_security().unwrap();
+    }
+
+    #[test]
+    fn test_hub_guard_public_bind_refused() {
+        let config = HubConfig {
+            rest_host: "203.0.113.10".into(), // TEST-NET public address
+            ..HubConfig::default()
+        };
+        let err = config.validate_bind_security().unwrap_err();
+        assert!(err.to_string().contains("plaintext"), "{err}");
+    }
+
+    #[test]
+    fn test_hub_guard_wildcard_refused() {
+        let config = HubConfig {
+            grpc_host: "0.0.0.0".into(),
+            ..HubConfig::default()
+        };
+        let err = config.validate_bind_security().unwrap_err();
+        assert!(err.to_string().contains("public address"), "{err}");
+    }
+
+    #[test]
+    fn test_hub_guard_dns_name_refused_without_tls() {
+        let config = HubConfig {
+            grpc_host: "hub.example.com".into(),
+            ..HubConfig::default()
+        };
+        let err = config.validate_bind_security().unwrap_err();
+        assert!(err.to_string().contains("not an IP"), "{err}");
+    }
+
+    #[test]
+    fn test_hub_guard_tailscale_allowed() {
+        let config = HubConfig {
+            grpc_host: "100.64.0.5".into(),
+            rest_host: "100.64.0.5".into(),
+            // Allowed (WireGuard encrypts), only warns.
+            ..HubConfig::default()
+        };
+        config.validate_bind_security().unwrap();
+    }
+
+    #[test]
+    fn test_hub_guard_partial_config() {
+        let yaml = "hub:\n  enabled: true\n";
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, yaml.as_bytes()).unwrap();
+
+        let config = Config::load(file.path().to_str().unwrap()).unwrap();
+        assert!(config.hub.enabled);
+        assert_eq!(config.hub.grpc_port, 50051);
+        assert_eq!(config.hub.rest_port, 8080);
+        assert_eq!(config.hub.retention_days, 90);
+        assert_eq!(config.hub.metrics_retention_days, 30);
+        assert!(!config.hub.tls.enabled);
     }
 }

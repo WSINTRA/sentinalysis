@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package sentinel.v1;
+
+service Ingest {
+  rpc SendMetrics(MetricsRequest) returns (Ack);
+  rpc SendLogs(LogsRequest) returns (Ack);
+}
+
+// Identity is NOT in the message — it is derived from the authenticated
+// X-API-KEY on the server side. Do not add identity fields here.
+message MetricsRequest {
+  MetricPoint point = 1;
+}
+
+message MetricPoint {
+  int64 timestamp_ms = 1;
+  double cpu_percent = 2;
+  uint64 mem_used_bytes = 3;
+  uint64 mem_total_bytes = 4;
+  uint64 disk_used_bytes = 5;
+  uint64 disk_total_bytes = 6;
+  double load_1m = 7;
+  double load_5m = 8;
+  uint64 net_rx_bytes_total = 9;
+  uint64 net_tx_bytes_total = 10;
+}
+
+message LogsRequest {
+  repeated LogLine lines = 1;
+}
+
+message LogLine {
+  int64 timestamp_ms = 1;
+  string container = 2;
+  string stream = 3;
+  string message = 4;
+}
+
+message Ack {
+  bool accepted = 1;
+  uint32 count = 2;
+}

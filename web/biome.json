@@ -1,0 +1,16 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.12/schema.json",
+  "vcs": { "enabled": false },
+  "files": { "ignoreUnknown": false },
+  "formatter": { "enabled": true, "indentStyle": "space", "lineWidth": 100 },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "a11y": {},
+      "security": {
+        "noDangerouslySetInnerHtml": "error"
+      }
+    }
+  }
+}

@@ -5,10 +5,12 @@
 //! entries. See the module docs of [`daemon`], [`tui`], and
 //! [`log_scanner`] for the respective halves of the system.
 
+pub mod agent;
 pub mod config;
 pub mod daemon;
 pub mod db;
 pub mod error;
+pub mod hub;
 pub mod log_scanner;
 pub mod service_tracker;
 pub mod setup;
