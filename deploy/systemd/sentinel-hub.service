@@ -1,0 +1,48 @@
+# Sentinel hub: gRPC ingestion + REST API + dashboard + retention.
+# Install: cp to /etc/systemd/system/, then
+#   systemctl daemon-reload && systemctl enable --now sentinel-hub
+# Requires: /etc/sentinel/hub.env (DATABASE_URL) and /etc/sentinel/hub.yaml
+# See deploy/README.md for the full setup and deploy/config/hub.example.yaml.
+
+[Unit]
+Description=Sentinel hub (ingestion + dashboard)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+EnvironmentFile=/etc/sentinel/hub.env
+ExecStart=/usr/local/bin/sentinel --hub --config /etc/sentinel/hub.yaml
+Restart=on-failure
+RestartSec=5
+
+# ---- Hardening: filesystem ----
+# All persistent state lives in Postgres; the hub only reads config,
+# the env file, the SPA bundle, and (optionally) TLS certs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Adjust these paths if your config/certs/SPA live elsewhere.
+# NOTE: with hub.tls.enabled, the cert/key paths must also be readable,
+# e.g. add: ReadOnlyPaths=/etc/sentinel/tls.crt /etc/sentinel/tls.key
+ReadOnlyPaths=/etc/sentinel
+# rest_host/grpc_host binds: loopback or Tailscale (100.64/10) without TLS;
+# anything else must enable hub.tls.enabled (startup guard refuses).
+
+[Install]
+WantedBy=multi-user.target

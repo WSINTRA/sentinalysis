@@ -60,6 +60,22 @@ DATABASE_URL=... cargo run -- hub-key revoke <key_id>
 SENTINEL_API_KEY_FILE=/etc/sentinel/agent.key cargo run -- --agent
 ```
 
+### Requirements & Permissions
+
+The TUI and daemon run fine as an unprivileged user, with two caveats:
+
+- **PID file**: the daemon writes `/run/sentinel.pid` by default. When
+  `/run` is absent or not writable (macOS, non-root Linux), it
+  automatically falls back to `<tmpdir>/sentinel.pid`. Pin an explicit
+  location with `SENTINEL_PID_FILE=/path/to/sentinel.pid` (useful when
+  several unprivileged users share a host, since the temp-dir fallback
+  is a fixed name).
+- **Log read access**: the default config tails `/var/log/nginx` and
+  `/var/log/auth.log`, which are group-restricted on most distros.
+  Debian/Ubuntu: add the daemon user to the `adm` group (and the nginx
+  log group if nginx logs are not group-readable via `adm`), or run as
+  root.
+
 ## Configuration
 
 Sentinel uses a YAML config file (path via `--config`, default `config.yaml`;
@@ -249,6 +265,7 @@ Raw log lines are stored only for non-noise entries to save space.
 proto/sentinel.proto      # gRPC contract (identity-free wire protocol)
 migrations/               # Postgres schema (sqlx)
 web/                      # React SPA dashboard (Vite)
+deploy/                   # systemd units, config/env examples, install recipes
 src/
 ├── main.rs               # CLI: --tui / --daemon / --hub / --agent, hub-key subcommand
 ├── config.rs             # YAML configuration loading (incl. hub + agent sections)
@@ -360,21 +377,17 @@ This host typically runs **both** the hub and the daemon (see
    # -> snt_...   copy this to vps1's /etc/sentinel/agent.key
    ```
 
-5. systemd units. Hub:
+5. systemd units — ready to install from [`deploy/systemd/`](deploy/systemd):
 
-   ```ini
-   # /etc/systemd/system/sentinel-hub.service
-   [Unit]
-   Description=Sentinel hub
-   After=network-online.target postgresql.service
-   [Service]
-   User=sentinel
-   EnvironmentFile=/etc/sentinel/hub.env
-   ExecStart=/usr/local/bin/sentinel --hub --config /etc/sentinel/hub.yaml
-   Restart=on-failure
-   [Install]
-   WantedBy=multi-user.target
+   ```bash
+   sudo cp deploy/systemd/sentinel-hub.service /etc/systemd/system/
    ```
+
+   `sentinel-hub.service` runs as the `sentinel` user with a read-only
+   filesystem (`ProtectSystem=strict`), all capabilities dropped, and
+   `EnvironmentFile=/etc/sentinel/hub.env` for `DATABASE_URL`. Example
+   env/config files: [`deploy/env/`](deploy/env),
+   [`deploy/config/`](deploy/config).
 
 6. Enable and verify:
 
@@ -391,21 +404,10 @@ This host typically runs **both** the hub and the daemon (see
 this server also run the daemon against the same Postgres to ingest its
 local nginx/auth logs (they show up under the hub's own hostname in the
 dashboard). The daemon uses the `log_watching`/`noise_filter` sections of
-`hub.yaml`:
-
-```ini
-# /etc/systemd/system/sentinel-daemon.service
-[Unit]
-Description=Sentinel log-scanner daemon (local host)
-After=network-online.target postgresql.service
-[Service]
-User=sentinel
-EnvironmentFile=/etc/sentinel/hub.env
-ExecStart=/usr/local/bin/sentinel --daemon --config /etc/sentinel/hub.yaml
-Restart=on-failure
-[Install]
-WantedBy=multi-user.target
-```
+`hub.yaml`. Install [`deploy/systemd/sentinel-daemon.service`](deploy/systemd/sentinel-daemon.service)
+the same way as the hub unit — it pins the PID file to a systemd-owned
+`/run/sentinel`, and adds the `adm` group so the unprivileged daemon can
+read nginx/auth logs.
 
 ### CLIENT VPS Deployment (monitored servers)
 
@@ -450,22 +452,14 @@ Run on every remote server you want to observe. No Postgres, no
    Make sure the `sentinel` user can read the log files (Debian: add it to the
    `adm` group and the nginx log group, or tail via a group-readable setup).
 
-3. systemd unit. The key is supplied via `SENTINEL_API_KEY_FILE` so the raw
-   key never sits in the world-readable config file:
-
-   ```ini
-   # /etc/systemd/system/sentinel-agent.service
-   [Unit]
-   Description=Sentinel agent
-   After=network-online.target
-   [Service]
-   User=sentinel
-   Environment=SENTINEL_API_KEY_FILE=/etc/sentinel/agent.key
-   ExecStart=/usr/local/bin/sentinel --agent --config /etc/sentinel/agent.yaml
-   Restart=on-failure
-   [Install]
-   WantedBy=multi-user.target
-   ```
+3. systemd unit — install
+   [`deploy/systemd/sentinel-agent.service`](deploy/systemd/sentinel-agent.service).
+   The key is supplied via `SENTINEL_API_KEY_FILE=/etc/sentinel/agent.key`
+   so the raw key never sits in the config file. The unit is the hardened
+   non-root template from SDK_PLAN.md: read-only filesystem, all
+   capabilities dropped, and outbound restricted to loopback + the
+   `100.64/10` tailnet range (comment those two lines out if your hub
+   lives elsewhere).
 
 4. Start and verify the round-trip:
 

@@ -46,6 +46,10 @@ wiring, alerting, session tracking, hub TLS termination, and packaging.
 - [x] CI: `.github/workflows/ci.yml` — fmt, clippy `-D warnings`, test,
   plus web lint/build
 - [x] Hub runs migrations on startup (`sqlx::migrate!` in `hub/run_hub.rs`)
+- [x] Deployment packaging (`deploy/`): hardened non-root systemd units for
+  hub/daemon/agent (ProtectSystem=strict, capability drop, tailnet-only
+  egress on the agent), `config/hub.example.yaml`, `config/agent.example.yaml`,
+  `env/hub.env.example`, and `deploy/README.md` install/upgrade recipes
 - [x] Service tracker implementation (discoverer, monitor, sdjournal tailer) —
   built and unit-tested, **not yet wired into the daemon**
 
@@ -76,10 +80,11 @@ wiring, alerting, session tracking, hub TLS termination, and packaging.
 
 - Daemon/TUI modes do not run migrations at startup (the hub does); a fresh
   Postgres still needs a manual `cargo sqlx migrate run` for local modes.
-- No `config.example.yaml` / `.env.example` committed (CLI defaults to
-  `config.yaml` and requires `DATABASE_URL`; `.env` is gitignored).
-- No packaging: no Dockerfile, no systemd `.service` units (SDK_PLAN.md
-  describes the intended hardened non-root agent unit), no Makefile/justfile.
+- Packaging (partial): hardened systemd units and config/env examples are
+  committed under `deploy/` (hub, daemon, agent; `deploy/README.md` recipes).
+  Still missing: a Dockerfile and a Makefile/justfile. The `deploy/`
+  templates cover the documented `.env.example` / `config.example.yaml` need
+  for hub/agent deployment.
 
 #### D. Code hygiene
 
@@ -113,8 +118,8 @@ Prioritized by leverage (each item is independently shippable):
    the 1000-row cap.
 7. **Alerting engine** — rules, evaluation over stored entries, notification.
 8. **Session tracking** — parse `who`/`w` → `active_sessions` + a TUI view.
-9. **Packaging** — systemd units (agent per SDK_PLAN.md, hub), Dockerfile,
-   `config.example.yaml` + `.env.example`.
+9. **Packaging (remaining)** — Dockerfile and a Makefile/justfile. The
+   systemd units and `config`/`env` examples shipped in `deploy/`.
 10. **Sync SPEC.md / PLAN.md** with the hub-and-agent architecture.
 
 ### Blockers
@@ -132,8 +137,9 @@ None.
   warnings && cargo test` green on every commit.
 - TUI polls the database at most every 2 s per selected source; the poll
   cursor is the newest on-screen entry (strict `(timestamp, id)` comparison).
-- Daemon is started on demand by the TUI; `SENTINEL_PID_FILE` overrides the
-  default PID file location (/run/sentinel.pid).
+- Daemon is started on demand by the TUI; the default PID file location
+  (/run/sentinel.pid) falls back to `<tmpdir>/sentinel.pid` when `/run` is
+  missing or unwritable, and `SENTINEL_PID_FILE` overrides both.
 - Hub binds `127.0.0.1` by default (gRPC :50051, REST :8080). Public binds
   without TLS are refused at startup; Tailscale (CGNAT) binds without TLS are
   allowed with a loud warning.

@@ -1,0 +1,33 @@
+# Sentinel agent config — copy to /etc/sentinel/agent.yaml on a monitored
+# VPS, chown sentinel:sentinel, chmod 0640. The raw API key does NOT go
+# here: it lives in /etc/sentinel/agent.key (0600) and is referenced via
+# SENTINEL_API_KEY_FILE in the systemd unit.
+
+agent:
+  enabled: true
+  hub_addr: 100.64.0.10:50051   # the hub's tailnet IP + gRPC port
+  # api_key: leave empty; the key is read from $SENTINEL_API_KEY_FILE
+  logs_enabled: true            # forward parsed/classified host logs
+  containers:                   # optional: Docker JSON-log forwarding
+    - app
+  metrics_interval_secs: 30
+  log_batch_size: 100
+  log_flush_interval_secs: 5
+  log_buffer_max: 10000
+
+# ---- What to tail locally (parsed + classified client-side) ----
+log_watching:
+  directories:
+    - path: /var/log/nginx
+      pattern: "*.log"
+  files:
+    - /var/log/auth.log
+
+# ---- Noise rules applied before forwarding (saves tailnet bandwidth) ----
+noise_filter:
+  excluded_ips:
+    - 127.0.0.1
+    - 100.64.0.10               # hub health checks, if any
+  health_check_paths:
+    - /health
+    - /healthz

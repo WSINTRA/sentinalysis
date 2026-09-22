@@ -1,0 +1,38 @@
+# Sentinel hub config — copy to /etc/sentinel/hub.yaml, chown
+# sentinel:sentinel, chmod 0640. Consumed by `sentinel --hub`; the
+# log_watching/noise_filter sections are used by the co-located daemon.
+
+hub:
+  enabled: true
+  # gRPC ingestion listens on the tailnet address so agents can dial it.
+  # Loopback is always fine; a Tailscale (100.64/10) bind is allowed
+  # without TLS (WireGuard encrypts); any other non-loopback bind MUST
+  # set tls.enabled or the hub refuses to start.
+  grpc_host: 100.64.0.10
+  grpc_port: 50051
+  # Dashboard/REST stays on loopback; reach it via SSH tunnel, a tailnet
+  # reverse proxy, or change rest_host (subject to the same TLS guard).
+  rest_host: 127.0.0.1
+  rest_port: 8080
+  spa_path: /opt/sentinel/web/dist
+  tls:
+    enabled: false
+    cert: /etc/sentinel/tls.crt
+    key: /etc/sentinel/tls.key
+  retention_days: 90            # app_events + log_entries (0 disables)
+  metrics_retention_days: 30    # system_metrics (0 disables)
+
+# ---- Host logs of THIS server, scanned by the co-located daemon ----
+log_watching:
+  directories:
+    - path: /var/log/nginx
+      pattern: "*.log"          # per-vhost: <vhost>-access.log
+  files:
+    - /var/log/auth.log
+
+noise_filter:
+  excluded_ips:
+    - 127.0.0.1
+  health_check_paths:
+    - /health
+    - /healthz

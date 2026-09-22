@@ -1,0 +1,48 @@
+# Sentinel daemon: tails/parses/classifies LOCAL logs into Postgres.
+# Run alongside sentinel-hub on the control server to monitor that host
+# (the hub itself never scans local logs). Uses the log_watching and
+# noise_filter sections of the config.
+# Install: cp to /etc/systemd/system/, then
+#   systemctl daemon-reload && systemctl enable --now sentinel-daemon
+
+[Unit]
+Description=Sentinel log-scanner daemon (local host)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+# Needs read access to the watched logs (Debian/Ubuntu: adm group).
+SupplementaryGroups=adm
+# The daemon maintains a PID file; systemd-owned /run/sentinel keeps it
+# writable without granting root-only /run access.
+RuntimeDirectory=sentinel
+Environment=SENTINEL_PID_FILE=/run/sentinel/sentinel.pid
+EnvironmentFile=/etc/sentinel/hub.env
+ExecStart=/usr/local/bin/sentinel --daemon --config /etc/sentinel/hub.yaml
+Restart=on-failure
+RestartSec=5
+
+# ---- Hardening: filesystem ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict          # read-only FS; log tailing only reads
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadOnlyPaths=/etc/sentinel /var/log/nginx /var/log/auth.log
+
+[Install]
+WantedBy=multi-user.target

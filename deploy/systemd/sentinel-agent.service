@@ -1,0 +1,66 @@
+# Sentinel agent: stateless forwarder (metrics + Docker logs + parsed
+# host logs) to the hub over gRPC. No Postgres, no DATABASE_URL.
+# Identity is the API key, supplied via SENTINEL_API_KEY_FILE so the raw
+# key never sits in the config file.
+# Install: cp to /etc/systemd/system/, then
+#   systemctl daemon-reload && systemctl enable --now sentinel-agent
+# See deploy/README.md and deploy/config/agent.example.yaml.
+
+[Unit]
+Description=Sentinel agent (metrics + log forwarder)
+After=network-online.target
+Wants=network-online.target
+# Docker is optional: discovery degrades gracefully if it is absent.
+# Use `Wants` (not `Requires`) so a docker-less VPS still boots the agent.
+Wants=docker.service
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+# Read access to local logs the agent tails/parses (Debian/Ubuntu: adm).
+SupplementaryGroups=adm
+Environment=SENTINEL_API_KEY_FILE=/etc/sentinel/agent.key
+ExecStart=/usr/local/bin/sentinel --agent --config /etc/sentinel/agent.yaml
+Restart=on-failure
+RestartSec=5
+
+# ---- Hardening: filesystem ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict          # entire FS read-only; log reads still work
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+# Config + key file (0600, owned by sentinel) and Docker JSON logs (grant
+# read without docker-group membership via ACLs — see deploy/README.md):
+ReadOnlyPaths=/etc/sentinel /var/lib/docker/containers
+
+# ---- Hardening: kernel / processes ----
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=        # drop ALL capabilities
+AmbientCapabilities=
+
+# ---- Hardening: network (optional; requires systemd with BPF support) ----
+# Outbound to the tailnet + loopback only. Comment out if it interferes.
+IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=100.64.0.0/10
+
+# ---- Resource limits (agent is tiny by design) ----
+LimitNOFILE=4096
+MemoryMax=256M                # headroom over the bounded buffer worst case
+CPUQuota=25%
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
