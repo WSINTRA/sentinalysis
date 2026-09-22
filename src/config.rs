@@ -247,6 +247,9 @@ pub struct AgentConfig {
     pub api_key: String,
     /// Docker container names to tail.
     pub containers: Vec<String>,
+    /// Forward daemon-parity host logs (tail `log_watching` sources,
+    /// parse/classify locally, ship structured entries to the hub).
+    pub logs_enabled: bool,
     pub metrics_interval_secs: u64,
     pub log_batch_size: usize,
     pub log_flush_interval_secs: u64,
@@ -264,6 +267,7 @@ impl Default for AgentConfig {
             hub_addr: "127.0.0.1:50051".into(),
             api_key: String::new(),
             containers: vec!["app".into()],
+            logs_enabled: false,
             metrics_interval_secs: 30,
             log_batch_size: 100,
             log_flush_interval_secs: 5,
@@ -402,6 +406,28 @@ journalctl:
         assert!(config.journalctl.enabled);
         assert_eq!(config.log_watching, LogWatchingConfig::default());
         assert_eq!(config.noise_filter, NoiseFilterConfig::default());
+    }
+
+    /// Agent section: `logs_enabled` opt-in for daemon-parity host logs.
+    #[test]
+    fn test_agent_logs_enabled_parses() {
+        let yaml = "agent:\n  enabled: true\n  logs_enabled: true\n";
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, yaml.as_bytes()).unwrap();
+
+        let config = Config::load(file.path().to_str().unwrap()).unwrap();
+        assert!(config.agent.enabled);
+        assert!(config.agent.logs_enabled);
+        // Omitted => off (existing deployments unaffected).
+        let yaml_off = "agent:\n  enabled: true\n";
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, yaml_off.as_bytes()).unwrap();
+        assert!(
+            !Config::load(file.path().to_str().unwrap())
+                .unwrap()
+                .agent
+                .logs_enabled
+        );
     }
 
     #[test]

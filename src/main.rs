@@ -66,6 +66,13 @@ async fn run() -> Result<(), SentinelError> {
     init_tracing();
 
     let config = load_config(&cli.config)?;
+
+    // The agent is the only mode without local database access: it
+    // forwards to the hub over gRPC and never touches Postgres.
+    if cli.agent {
+        return sentinel::agent::run(config).await;
+    }
+
     let database_url = std::env::var("DATABASE_URL").map_err(|_| {
         SentinelError::ConfigError("DATABASE_URL environment variable not set".into())
     })?;
@@ -83,8 +90,6 @@ async fn run() -> Result<(), SentinelError> {
             "TUI"
         } else if cli.hub {
             "hub"
-        } else if cli.agent {
-            "agent"
         } else {
             "daemon"
         }
@@ -95,8 +100,6 @@ async fn run() -> Result<(), SentinelError> {
         run_tui(pool, &config).await
     } else if cli.hub {
         sentinel::hub::run_hub::run(pool, config).await
-    } else if cli.agent {
-        sentinel::agent::run(config).await
     } else {
         run_daemon(pool, config).await
     }

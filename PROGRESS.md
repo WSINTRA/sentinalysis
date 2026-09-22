@@ -34,6 +34,11 @@ wiring, alerting, session tracking, hub TLS termination, and packaging.
 - [x] Agent mode (`--agent`, src/agent/): sysinfo metrics every 30 s, Docker
   container JSON-log discovery/tailing, bounded batcher with reconnect and
   shutdown flush, gRPC forwarding
+- [x] Agent daemon parity (`src/agent/logs.rs`): host logs tailed/parsed/
+  filtered/classified locally via the `log_scanner` pipeline and forwarded as
+  structured `ParsedLogEntry` protos (`agent.logs_enabled`); the hub stores
+  them verbatim — no re-classification — and tags `log_entries.source_host`.
+  `SENTINEL_API_KEY_FILE` now loads the key; agent mode needs no `DATABASE_URL`
 - [x] proto/sentinel.proto + tonic-build codegen (build.rs); the wire protocol
   carries no identity fields — identity comes from the key row
 - [x] React SPA (web/): KeyGate unlock screen (X-API-KEY, sessionStorage),

@@ -161,7 +161,7 @@ async fn test_hub_end_to_end() {
         ..AgentConfig::default()
     };
     let cancel = tokio_util::sync::CancellationToken::new();
-    let mut client = HubClient::connect(&agent_config, &cancel)
+    let client = HubClient::connect(&agent_config, &cancel)
         .await
         .expect("agent connects to hub");
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -199,6 +199,62 @@ async fn test_hub_end_to_end() {
         ])
         .await
         .expect("logs accepted");
+
+    // Daemon-parity parsed-entry ingestion: structured fields must be
+    // stored verbatim (no hub-side re-classification) and scoped to the
+    // key's hostname via `source_host`.
+    client
+        .send_logs_request(sentinel::hub::pb::LogsRequest {
+            lines: vec![],
+            parsed_lines: vec![sentinel::hub::pb::ParsedLogEntry {
+                timestamp_ms: now_ms,
+                level: "security".into(),
+                message: format!("e2e-parsed-{suffix}"),
+                raw_line: Some(format!("e2e-parsed-{suffix}")),
+                client_ip: Some("203.0.113.9".into()),
+                request_path: Some("/users?id=1 UNION SELECT".into()),
+                status_code: Some(400),
+                response_time_ms: Some(12),
+                is_noise: false,
+                noise_reason: None,
+                threat_level: "high".into(),
+                threat_categories: vec!["sql-injection".into()],
+                service_name: format!("e2e-{suffix}.example.com"),
+                service_unit_type: "nginx-vhost".into(),
+                virtual_host: Some(format!("e2e-{suffix}.example.com")),
+            }],
+        })
+        .await
+        .expect("parsed logs accepted");
+
+    let parsed: Option<(String, String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT level, threat_level, status_code::BIGINT, source_host \
+           FROM log_entries WHERE raw_line = $1",
+    )
+    .bind(format!("e2e-parsed-{suffix}"))
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let (level, threat, status, source) = parsed.expect("parsed entry stored");
+    assert_eq!(level, "security");
+    assert_eq!(threat, "high");
+    assert_eq!(status, 400);
+    assert_eq!(source.as_deref(), Some(hostname.as_str()));
+
+    let (svc,): (String,) = sqlx::query_as(
+        "SELECT s.name FROM log_entries l JOIN services s ON s.id = l.service_id \
+          WHERE l.raw_line = $1",
+    )
+    .bind(format!("e2e-parsed-{suffix}"))
+    .fetch_optional(&pool)
+    .await
+    .unwrap()
+    .expect("service linked by name");
+    assert_eq!(
+        svc,
+        format!("e2e-{suffix}.example.com"),
+        "service resolved by name"
+    );
 
     // Rows must be visible in Postgres, scoped to the key's hostname.
     let (metric_count,): (i64,) =
@@ -465,6 +521,7 @@ async fn test_hub_end_to_end() {
             noise_reason: None,
             threat_level: "none".into(),
             threat_categories: vec![],
+            source_host: None,
         }])
         .await
         .unwrap();

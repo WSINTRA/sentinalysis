@@ -28,6 +28,11 @@ message MetricPoint {
 
 message LogsRequest {
   repeated LogLine lines = 1;
+  // Structured entries already parsed, filtered, and classified by the
+  // agent's log pipeline. The hub stores them as-is: no parsing or
+  // classification happens server-side (see AGENTS.md separation of
+  // concerns).
+  repeated ParsedLogEntry parsed_lines = 2;
 }
 
 message LogLine {
@@ -35,6 +40,27 @@ message LogLine {
   string container = 2;
   string stream = 3;
   string message = 4;
+}
+
+// One InsertLogEntry produced by the agent-side pipeline. Service
+// identity is carried by name/unit_type (the agent has no database; the
+// hub owns services-row IDs).
+message ParsedLogEntry {
+  int64 timestamp_ms = 1;
+  string level = 2;
+  string message = 3;
+  optional string raw_line = 4;
+  optional string client_ip = 5;
+  optional string request_path = 6;
+  optional int32 status_code = 7;
+  optional int64 response_time_ms = 8;
+  bool is_noise = 9;
+  optional string noise_reason = 10;
+  string threat_level = 11;
+  repeated string threat_categories = 12;
+  string service_name = 13;
+  string service_unit_type = 14;
+  optional string virtual_host = 15;
 }
 
 message Ack {

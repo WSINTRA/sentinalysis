@@ -1,13 +1,18 @@
-//! Sentinel agent: forwards system metrics + Docker logs to the hub.
+//! Sentinel agent: forwards system metrics, Docker logs, and parsed
+//! local log entries to the hub.
 //!
 //! The agent is a stateless forwarder: its identity is its API key, and
 //! the hub derives `agent_id`/`hostname` from the key row (nothing
-//! identity-shaped crosses the wire). Runs as a hardened non-root systemd service.
+//! identity-shaped crosses the wire). Host logs are parsed, filtered, and
+//! classified locally (same pipeline as the daemon); the hub only stores
+//! them. Runs as a hardened non-root systemd service.
 
 pub mod batcher;
 pub mod docker_logs;
+pub mod logs;
 pub mod metrics;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -30,15 +35,20 @@ pub async fn run(config: Config) -> Result<(), SentinelError> {
             "agent mode requested but agent.enabled is false in the config".into(),
         ));
     }
-    if agent.api_key.is_empty() {
-        return Err(SentinelError::ConfigError(
-            "agent.api_key (or SENTINEL_API_KEY_FILE) is required in agent mode".into(),
-        ));
-    }
+    let api_key = resolve_api_key(agent)?;
 
     let cancel = CancellationToken::new();
 
-    let mut client = HubClient::connect(agent, &cancel).await?;
+    let mut client_config = agent.clone();
+    client_config.api_key = api_key;
+    let client = HubClient::connect(&client_config, &cancel).await?;
+
+    // Daemon-parity log forwarding: tail → parse → filter → classify
+    // locally, then ship structured entries to the hub.
+    if agent.logs_enabled {
+        logs::spawn_log_forwarding(&config, &client, &cancel)?;
+    }
+
     let mut batcher = BoundedBatcher::new(agent.log_buffer_max);
 
     // Discover containers once; retry discovery on the next flush cycle if
@@ -72,7 +82,7 @@ pub async fn run(config: Config) -> Result<(), SentinelError> {
     loop {
         tokio::select! {
             () = cancel.cancelled() => {
-                shutdown(&mut client, &mut batcher, agent.flush_timeout_secs).await;
+                shutdown(&client, &mut batcher, agent.flush_timeout_secs).await;
                 return Ok(());
             }
             _ = metrics_interval.tick() => {
@@ -94,7 +104,7 @@ pub async fn run(config: Config) -> Result<(), SentinelError> {
                 }
             }
             _ = flush_interval.tick() => {
-                flush(&mut client, &mut batcher, agent.log_batch_size).await;
+                flush(&client, &mut batcher, agent.log_batch_size).await;
             }
             line = log_rx.recv() => {
                 let Some(line) = line else {
@@ -109,7 +119,7 @@ pub async fn run(config: Config) -> Result<(), SentinelError> {
                     message: line.message.clone(),
                 });
                 if batcher.len() >= agent.log_batch_size {
-                    flush(&mut client, &mut batcher, agent.log_batch_size).await;
+                    flush(&client, &mut batcher, agent.log_batch_size).await;
                 }
             }
         }
@@ -117,7 +127,7 @@ pub async fn run(config: Config) -> Result<(), SentinelError> {
 }
 
 /// Flushes buffered lines (bounded per request).
-async fn flush(client: &mut HubClient, batcher: &mut BoundedBatcher, batch_size: usize) {
+async fn flush(client: &HubClient, batcher: &mut BoundedBatcher, batch_size: usize) {
     if batcher.is_empty() {
         return;
     }
@@ -141,7 +151,7 @@ async fn flush(client: &mut HubClient, batcher: &mut BoundedBatcher, batch_size:
 }
 
 /// Final flush with a deadline; leftover drops are counted and logged.
-async fn shutdown(client: &mut HubClient, batcher: &mut BoundedBatcher, timeout_secs: u64) {
+async fn shutdown(client: &HubClient, batcher: &mut BoundedBatcher, timeout_secs: u64) {
     let deadline = Duration::from_secs(timeout_secs.max(1));
     let flush_future = flush(client, batcher, usize::MAX);
     if tokio::time::timeout(deadline, flush_future).await.is_err() {
@@ -159,10 +169,52 @@ async fn shutdown(client: &mut HubClient, batcher: &mut BoundedBatcher, timeout_
     );
 }
 
-/// gRPC client with `x-api-key` auth on every call.
+/// Resolve the agent's raw API key: inline config first, then the file
+/// named by `SENTINEL_API_KEY_FILE` (trailing whitespace trimmed).
+///
+/// # Errors
+/// `ConfigError` when neither source yields a key, or the key file
+/// cannot be read.
+fn resolve_api_key(agent: &AgentConfig) -> Result<String, SentinelError> {
+    if !agent.api_key.is_empty() {
+        return Ok(agent.api_key.clone());
+    }
+    let path = match std::env::var("SENTINEL_API_KEY_FILE") {
+        Ok(path) if !path.is_empty() => path,
+        _ => {
+            return Err(SentinelError::ConfigError(
+                "agent.api_key (or SENTINEL_API_KEY_FILE) is required in agent mode".into(),
+            ));
+        }
+    };
+    read_api_key_file(&path)
+}
+
+/// Reads and trims the raw key from `path`.
+///
+/// # Errors
+/// `ConfigError` on read failure or an empty file.
+fn read_api_key_file(path: &str) -> Result<String, SentinelError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        SentinelError::ConfigError(format!(
+            "failed to read SENTINEL_API_KEY_FILE '{path}': {e}"
+        ))
+    })?;
+    let key = raw.trim().to_string();
+    if key.is_empty() {
+        return Err(SentinelError::ConfigError(format!(
+            "SENTINEL_API_KEY_FILE '{path}' is empty"
+        )));
+    }
+    Ok(key)
+}
+
+/// gRPC client with `x-api-key` auth on every call. Cheap to clone
+/// (shared inner client), so sinks can hold their own handle.
+#[derive(Clone)]
 pub struct HubClient {
-    client: IngestClient<tonic::transport::Channel>,
-    api_key: String,
+    client: Arc<tokio::sync::Mutex<IngestClient<tonic::transport::Channel>>>,
+    api_key: Arc<String>,
 }
 
 impl HubClient {
@@ -213,8 +265,8 @@ impl HubClient {
         };
 
         Ok(Self {
-            client: IngestClient::new(channel),
-            api_key: agent.api_key.clone(),
+            client: Arc::new(tokio::sync::Mutex::new(IngestClient::new(channel))),
+            api_key: Arc::new(agent.api_key.clone()),
         })
     }
 
@@ -225,24 +277,83 @@ impl HubClient {
     // tonic::Status is a fixed-size type imposed by the client API; the
     // lint's boxing suggestion would only complicate call sites.
     #[allow(unknown_lints, clippy::result_large_err)]
-    pub async fn send_metrics(&mut self, point: MetricPoint) -> Result<(), tonic::Status> {
-        let mut request = tonic::Request::new(MetricsRequest { point: Some(point) });
-        request
-            .metadata_mut()
-            .insert("x-api-key", self.api_key.parse().expect("valid metadata"));
-        self.client.send_metrics(request).await.map(|_| ())
+    pub async fn send_metrics(&self, point: MetricPoint) -> Result<(), tonic::Status> {
+        let request = self.decorate(MetricsRequest { point: Some(point) });
+        let mut client = self.client.lock().await;
+        client.send_metrics(request).await.map(|_| ())
     }
 
-    /// Sends a batch of log lines.
+    /// Sends a batch of raw Docker log lines.
     ///
     /// # Errors
     /// gRPC failure.
     #[allow(unknown_lints, clippy::result_large_err)]
-    pub async fn send_logs(&mut self, lines: Vec<LogLine>) -> Result<(), tonic::Status> {
-        let mut request = tonic::Request::new(LogsRequest { lines });
+    pub async fn send_logs(&self, lines: Vec<LogLine>) -> Result<(), tonic::Status> {
+        self.send_logs_request(LogsRequest {
+            lines,
+            parsed_lines: vec![],
+        })
+        .await
+    }
+
+    /// Sends a fully built ingestion request (used by the parsed-log
+    /// sink in `agent::logs`).
+    ///
+    /// # Errors
+    /// gRPC failure.
+    #[allow(unknown_lints, clippy::result_large_err)]
+    pub async fn send_logs_request(&self, request: LogsRequest) -> Result<(), tonic::Status> {
+        let request = self.decorate(request);
+        let mut client = self.client.lock().await;
+        client.send_logs(request).await.map(|_| ())
+    }
+
+    /// Attaches the `x-api-key` metadata to a request.
+    fn decorate<T>(&self, message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request.metadata_mut().insert(
+            "x-api-key",
+            self.api_key.as_str().parse().expect("valid metadata"),
+        );
         request
-            .metadata_mut()
-            .insert("x-api-key", self.api_key.parse().expect("valid metadata"));
-        self.client.send_logs(request).await.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_read_api_key_file_trims_whitespace() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "snt_abc123\n").unwrap();
+        assert_eq!(
+            read_api_key_file(file.path().to_str().unwrap()).unwrap(),
+            "snt_abc123"
+        );
+    }
+
+    #[test]
+    fn test_read_api_key_file_rejects_empty() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "   ").unwrap();
+        assert!(read_api_key_file(file.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_read_api_key_file_missing_is_config_error() {
+        let err = read_api_key_file("/nonexistent/agent.key").unwrap_err();
+        assert!(matches!(err, SentinelError::ConfigError(_)));
+    }
+
+    #[test]
+    fn test_resolve_api_key_prefers_inline_config() {
+        let agent = AgentConfig {
+            api_key: "snt_inline".into(),
+            ..AgentConfig::default()
+        };
+        assert_eq!(resolve_api_key(&agent).unwrap(), "snt_inline");
     }
 }

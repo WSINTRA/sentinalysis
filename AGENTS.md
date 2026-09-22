@@ -25,7 +25,9 @@ Each module has a single responsibility:
 - `daemon/`: Only process supervision and the tailer → scanner loop
 - `hub/`: Only ingestion servers, API auth, retention, SPA serving —
   no classification or filtering logic
-- `agent/`: Only metric/log collection and gRPC forwarding; no identity of
+- `agent/`: Only local collection (metrics, Docker logs) and the
+  daemon-parity host-log pipeline (tail → parse → filter → classify via
+  `log_scanner`), forwarded over gRPC; no storage, no identity of
   its own beyond its API key
 - `tui/`: Only rendering and key handling; data via the `LogDataSource` trait
 - `db/`: Only data persistence
@@ -100,7 +102,7 @@ src/
 ├── db/               # Pool + repositories
 ├── log_scanner/      # Tailer, parsers, filter, classifier, pipeline
 ├── hub/              # gRPC/REST servers, auth, retention, keys CLI
-├── agent/            # Metrics, Docker logs, batched gRPC forwarding
+├── agent/            # Metrics, Docker logs, daemon-parity host logs, batched gRPC forwarding
 ├── service_tracker/  # Systemd discovery/monitor/journalctl (unwired)
 └── tui/              # ratatui interface
     └── <domain>/

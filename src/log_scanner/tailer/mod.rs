@@ -106,6 +106,22 @@ impl FileTailer {
         Self::default()
     }
 
+    /// Build a tailer from the configured watch targets (directories with
+    /// glob patterns plus explicit files). Shared by the daemon and the
+    /// agent so both tail exactly the same sources.
+    pub fn from_watch_config(
+        config: &crate::config::LogWatchingConfig,
+    ) -> Result<Self, SentinelError> {
+        let mut tailer = Self::new();
+        for dir_config in &config.directories {
+            tailer = tailer.with_watch_directory(dir_config.path.clone(), &dir_config.pattern)?;
+        }
+        if !config.files.is_empty() {
+            tailer = tailer.with_files(config.files.clone());
+        }
+        Ok(tailer)
+    }
+
     /// Tail these explicit files.
     #[must_use]
     pub fn with_files(mut self, files: Vec<PathBuf>) -> Self {

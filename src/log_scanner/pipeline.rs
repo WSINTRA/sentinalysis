@@ -326,6 +326,7 @@ impl Pipeline {
                     .iter()
                     .map(|c| c.as_str().to_string())
                     .collect(),
+                source_host: None,
             }))
         })
     }

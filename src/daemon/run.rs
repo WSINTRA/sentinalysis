@@ -15,17 +15,7 @@ use crate::log_scanner::tailer::FileTailer;
 
 /// Build the tailer from the configured watch targets.
 fn build_tailer(config: &Config) -> Result<FileTailer, SentinelError> {
-    let mut tailer = FileTailer::new();
-
-    for dir_config in &config.log_watching.directories {
-        tailer = tailer.with_watch_directory(dir_config.path.clone(), &dir_config.pattern)?;
-    }
-
-    if !config.log_watching.files.is_empty() {
-        tailer = tailer.with_files(config.log_watching.files.clone());
-    }
-
-    Ok(tailer)
+    FileTailer::from_watch_config(&config.log_watching)
 }
 
 /// Tail the configured logs and feed them through the scanner until

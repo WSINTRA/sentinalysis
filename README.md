@@ -9,7 +9,9 @@ Lightweight, secure server monitoring tool written in Rust.
 - **TUI**: ratatui interface with sources panel, entry list, filtering, and threat badges
 - **Daemon mode**: Background scanner started on demand by the TUI (PID-file supervised)
 - **Hub mode**: Central server — gRPC ingestion (tonic), REST API (actix), dashboard serving, API-key auth, age-based retention
-- **Agent mode**: Lightweight forwarder — system metrics (sysinfo) + Docker container logs → hub over gRPC
+- **Agent mode**: Lightweight forwarder — system metrics (sysinfo), Docker
+  container logs, and daemon-parity host logs (tail/parse/classify locally
+  via the same `log_scanner` pipeline) → hub over gRPC
 - **Web dashboard**: React SPA with key-gate unlock, metrics, app events stream, and server list
 - **Threat detection**: SQL injection, XSS, path traversal, command injection, brute force, scanner UAs
 - **Noise filtering**: Health checks and static assets stored as noise, known bots excluded
@@ -53,7 +55,8 @@ DATABASE_URL=... cargo run -- hub-key create --dashboard "ops team"
 DATABASE_URL=... cargo run -- hub-key list
 DATABASE_URL=... cargo run -- hub-key revoke <key_id>
 
-# Run an agent that forwards metrics + Docker logs to the hub
+# Run an agent that forwards metrics, Docker logs, and parsed host logs
+# to the hub (no DATABASE_URL needed — the agent never touches Postgres)
 SENTINEL_API_KEY_FILE=/etc/sentinel/agent.key cargo run -- --agent
 ```
 
@@ -112,6 +115,8 @@ agent:
   api_key: snt_...              # or leave empty and set SENTINEL_API_KEY_FILE
   containers:
     - app
+  logs_enabled: true            # forward parsed host logs (daemon parity);
+                                # uses the log_watching + noise_filter above
   metrics_interval_secs: 30
   log_batch_size: 100
   log_flush_interval_secs: 5
@@ -268,7 +273,7 @@ src/
 │   └── tailer/           # FileTailer (notify-based, rotation aware)
 ├── hub/                  # Hub mode: central server
 │   ├── auth.rs           # API-key auth (key_id lookup → argon2 verify)
-│   ├── grpc.rs           # gRPC ingestion (metrics + Docker logs)
+│   ├── grpc.rs           # gRPC ingestion (metrics + Docker logs + parsed host logs)
 │   ├── rest/             # actix REST: health, event ingest, read API, headers
 │   ├── keys_cli.rs       # `hub-key create/list/revoke`
 │   ├── retention.rs      # Age-based deletion jobs
@@ -276,6 +281,7 @@ src/
 ├── agent/                # Agent mode: remote forwarder
 │   ├── metrics.rs        # sysinfo CPU/mem/disk/load sampling
 │   ├── docker_logs.rs    # Docker container JSON-log discovery + tailing
+│   ├── logs.rs           # Daemon-parity host logs: tail → parse → classify → gRPC sink
 │   └── batcher.rs        # Bounded batch buffer → gRPC, reconnect, flush
 ├── service_tracker/      # Systemd tracking, not yet wired
 │   ├── discoverer.rs     # Auto-discover services from systemd paths
@@ -290,6 +296,202 @@ src/
         ├── log_viewer/   # Two-panel viewer (state + rendering)
         └── status_bar.rs # Key hints and transient messages
 ```
+
+## Deployment
+
+The recommended topology: **one hub on the control server**, **one agent on
+each monitored VPS**. The hub is the only node that touches Postgres; agents
+ship metrics, Docker logs, and parsed/classified host logs back over gRPC,
+identified solely by their API key. The dashboard is reached over the
+[Tailscale](https://tailscale.com) tailnet, so no public ports are opened.
+
+### HUB VPS Deployment (control server)
+
+Run on the main server you want to act as the command-and-control node.
+This host typically runs **both** the hub and the daemon (see
+"Monitoring the hub host" below).
+
+1. Install build deps and build (release binary + dashboard SPA):
+
+   ```bash
+   sudo apt install -y build-essential protobuf-compiler libssl-dev postgresql
+   cargo build --release                     # target/release/sentinel
+   ( cd web && npm ci && npm run build )     # web/dist served by the hub
+   ```
+
+2. Provision Postgres (the hub runs migrations itself on startup):
+
+   ```bash
+   sudo -u postgres createuser sentinel --no-createdb --no-superuser
+   sudo -u postgres createdb -O sentinel sentinel
+   ```
+
+3. Write `/etc/sentinel/hub.env` and `/etc/sentinel/hub.yaml`:
+
+   ```bash
+   # /etc/sentinel/hub.env
+   DATABASE_URL=postgresql://sentinel:REDACTED@127.0.0.1/sentinel
+   ```
+
+   ```yaml
+   # /etc/sentinel/hub.yaml — bind on the tailnet address (see the guard below)
+   hub:
+     enabled: true
+     grpc_host: 100.64.0.10   # the hub's Tailscale IP; agents dial here
+     grpc_port: 50051
+     rest_host: 127.0.0.1     # dashboard/REST stay local; reach via tailnet
+     rest_port: 8080
+     spa_path: /opt/sentinel/web/dist
+     retention_days: 90
+     metrics_retention_days: 30
+   ```
+
+   The hub refuses to bind a non-loopback, non-Tailscale address without TLS
+   (`hub.validate_bind_security`). A Tailscale (`100.64/10`) bind is allowed
+   with a warning since WireGuard already encrypts the transport; for a public
+   bind, set `hub.tls.enabled` + cert/key.
+
+4. Create one agent key per monitored VPS. The raw key is printed exactly
+   once; it is stored only as an argon2 hash:
+
+   ```bash
+   sudo -u sentinel env DATABASE_URL="$DATABASE_URL" \
+     sentinel hub-key create --agent vps1
+   # -> snt_...   copy this to vps1's /etc/sentinel/agent.key
+   ```
+
+5. systemd units. Hub:
+
+   ```ini
+   # /etc/systemd/system/sentinel-hub.service
+   [Unit]
+   Description=Sentinel hub
+   After=network-online.target postgresql.service
+   [Service]
+   User=sentinel
+   EnvironmentFile=/etc/sentinel/hub.env
+   ExecStart=/usr/local/bin/sentinel --hub --config /etc/sentinel/hub.yaml
+   Restart=on-failure
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+6. Enable and verify:
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now sentinel-hub
+   curl -s localhost:8080/v1/health          # REST up
+   # open http://<hub-tailscale-ip>:8080/ on your workstation (unlock with a
+   # dashboard key: `sentinel hub-key create --dashboard "ops team"`);
+   # the hub also lists connected agents/hosts as agents report in.
+   ```
+
+**Monitoring the hub host**: the hub itself never scans local logs, so on
+this server also run the daemon against the same Postgres to ingest its
+local nginx/auth logs (they show up under the hub's own hostname in the
+dashboard). The daemon uses the `log_watching`/`noise_filter` sections of
+`hub.yaml`:
+
+```ini
+# /etc/systemd/system/sentinel-daemon.service
+[Unit]
+Description=Sentinel log-scanner daemon (local host)
+After=network-online.target postgresql.service
+[Service]
+User=sentinel
+EnvironmentFile=/etc/sentinel/hub.env
+ExecStart=/usr/local/bin/sentinel --daemon --config /etc/sentinel/hub.yaml
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+```
+
+### CLIENT VPS Deployment (monitored servers)
+
+Run on every remote server you want to observe. No Postgres, no
+`DATABASE_URL` — the agent only needs its API key and the hub's gRPC address.
+
+1. Copy the release binary (built on the hub or CI); no build deps needed
+   on the client. Add the `sentinel` system user:
+
+   ```bash
+   sudo useradd --system --home /etc/sentinel --shell /usr/sbin/nologin sentinel
+   ```
+
+2. Drop the agent key created on the hub, and a minimal config:
+
+   ```bash
+   sudo mkdir -p /etc/sentinel
+   printf 'snt_...\n' | sudo tee /etc/sentinel/agent.key >/dev/null  # the raw key from step 4 of the hub deploy
+   sudo chown sentinel:sentinel /etc/sentinel/agent.key
+   sudo chmod 600 /etc/sentinel/agent.key
+   ```
+
+   ```yaml
+   # /etc/sentinel/agent.yaml
+   log_watching:                 # what to tail locally (parsed + classified here)
+     directories:
+       - path: /var/log/nginx
+         pattern: "*.log"
+     files:
+       - /var/log/auth.log
+   noise_filter:                 # applied client-side (health checks, bots, …)
+     excluded_ips: [127.0.0.1]
+   agent:
+     enabled: true
+     hub_addr: 100.64.0.10:50051   # hub's tailnet IP
+     logs_enabled: true            # forward host logs (daemon parity)
+     containers:                   # optional: Docker JSON logs
+       - app
+     metrics_interval_secs: 30
+   ```
+
+   Make sure the `sentinel` user can read the log files (Debian: add it to the
+   `adm` group and the nginx log group, or tail via a group-readable setup).
+
+3. systemd unit. The key is supplied via `SENTINEL_API_KEY_FILE` so the raw
+   key never sits in the world-readable config file:
+
+   ```ini
+   # /etc/systemd/system/sentinel-agent.service
+   [Unit]
+   Description=Sentinel agent
+   After=network-online.target
+   [Service]
+   User=sentinel
+   Environment=SENTINEL_API_KEY_FILE=/etc/sentinel/agent.key
+   ExecStart=/usr/local/bin/sentinel --agent --config /etc/sentinel/agent.yaml
+   Restart=on-failure
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+4. Start and verify the round-trip:
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now sentinel-agent
+   journalctl -u sentinel-agent -f
+   ```
+
+   The agent reconnects with exponential backoff if the hub is unreachable,
+   and buffers/drops-oldest within `log_buffer_max`.
+
+5. In the hub dashboard you should now see the client host with its CPU/mem
+   samples, container logs, and parsed/classified `log_entries` tagged with
+   its `source_host`. When a VPS is decommissioned, revoke its key from the
+   hub: `sentinel hub-key revoke <key_id>` (auth is per-request, so it stops
+   immediately).
+
+**Upgrading the hub-and-agent fleet**: `git pull && cargo build --release`
+on the hub (needs `protoc`), restart `sentinel-hub` — the hub applies any
+new `migrations/` automatically at startup (the daemon needs a manual
+`cargo sqlx migrate run`; a release with no new migration files needs no
+DB step at all). Always **upgrade the hub before the agents**: the
+parsed-log field (`LogsRequest.parsed_lines`) is additive in the proto, so
+an old hub would silently ignore batches from a new agent. Then copy the
+new binary to each client VPS and `systemctl restart sentinel-agent`.
 
 ## Documentation
 

@@ -103,6 +103,9 @@ pub struct InsertLogEntry {
     pub threat_level: String,
     /// Stored threat categories (see `ThreatCategory::as_str`).
     pub threat_categories: Vec<String>,
+    /// Hostname of the agent that forwarded this entry (hub ingestion
+    /// only; `None` for locally scanned entries).
+    pub source_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
