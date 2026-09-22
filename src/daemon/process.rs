@@ -11,11 +11,47 @@ use crate::error::SentinelError;
 
 const DEFAULT_PID_FILE: &str = "/run/sentinel.pid";
 /// Env var that overrides the PID file location (useful for tests and
-/// for running without write access to `/run`).
+/// for pinning the file to a custom path; without it, an unwritable
+/// `/run` falls back to the temp dir automatically).
 const PID_FILE_ENV: &str = "SENTINEL_PID_FILE";
 
 fn pid_file_path() -> PathBuf {
-    std::env::var_os(PID_FILE_ENV).map_or_else(|| PathBuf::from(DEFAULT_PID_FILE), PathBuf::from)
+    std::env::var_os(PID_FILE_ENV).map_or_else(
+        || resolve_pid_file(Path::new(DEFAULT_PID_FILE)),
+        PathBuf::from,
+    )
+}
+
+/// Resolve the default PID file location: use `primary` when its parent
+/// directory exists and is writable, otherwise fall back to a file in the
+/// system temp dir. This lets unprivileged runs succeed on hosts where
+/// `/run` is absent (macOS) or root-only (Linux without sudo).
+fn resolve_pid_file(primary: &Path) -> PathBuf {
+    let usable = primary
+        .parent()
+        .is_some_and(|dir| dir.is_dir() && dir_is_writable(dir));
+    if usable {
+        primary.to_path_buf()
+    } else {
+        fallback_pid_file()
+    }
+}
+
+fn fallback_pid_file() -> PathBuf {
+    std::env::temp_dir().join("sentinel.pid")
+}
+
+/// True when `dir` can be written to. Probed by creating and removing a
+/// file so it is correct regardless of uid, ownership, or ACLs.
+fn dir_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".sentinel-probe-{}", process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// True when a live process holds the PID file at `pid_file`.
@@ -147,5 +183,44 @@ mod tests {
 
         remove_pid_file_at(&pid_file);
         assert!(!pid_file.exists());
+    }
+
+    /// A writable parent directory keeps the primary PID file location.
+    #[test]
+    fn test_resolve_pid_file_uses_primary_when_parent_writable() {
+        let dir = TempDir::new().unwrap();
+        let primary = dir.path().join("sentinel.pid");
+        assert_eq!(resolve_pid_file(&primary), primary);
+    }
+
+    /// A missing parent directory (e.g. `/run` on macOS) must fall back
+    /// to the temp dir instead of failing with Permission denied.
+    #[test]
+    fn test_resolve_pid_file_falls_back_when_parent_missing() {
+        let primary = Path::new("/nonexistent-sentinel-test-dir/sentinel.pid");
+        assert_eq!(resolve_pid_file(primary), fallback_pid_file());
+    }
+
+    /// A present but unwritable parent (e.g. root-only `/run` for an
+    /// unprivileged daemon) must also fall back to the temp dir.
+    #[test]
+    fn test_resolve_pid_file_falls_back_when_parent_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let primary = ro.join("sentinel.pid");
+
+        // root ignores the permission bits, so assert against the probe.
+        let expected = if dir_is_writable(&ro) {
+            primary.clone()
+        } else {
+            fallback_pid_file()
+        };
+        assert_eq!(resolve_pid_file(&primary), expected);
+
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
