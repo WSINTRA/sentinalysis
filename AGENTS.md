@@ -2,7 +2,11 @@
 
 ## Project Overview
 
-Sentinel is a Rust-based server monitoring tool. This document guides development with consistent patterns and standards.
+Sentinel is a Rust-based server monitoring tool with four modes in one
+binary: `--tui` (terminal viewer), `--daemon` (local log scanner), `--hub`
+(gRPC/REST central server + dashboard), and `--agent` (remote forwarder),
+plus a `hub-key` subcommand for API key management. This document guides
+development with consistent patterns and standards.
 
 ## Code Style
 
@@ -17,12 +21,16 @@ Sentinel is a Rust-based server monitoring tool. This document guides developmen
 ### Separation of Concerns
 
 Each module has a single responsibility:
-- `log_scanner/`: Only log parsing, filtering, classification
-- `system_monitor/`: Only system metrics collection
-- `service_tracker/`: Only systemd service management
-- `api/`: Only HTTP handling, no business logic
+- `log_scanner/`: Only log tailing, parsing, filtering, classification
+- `daemon/`: Only process supervision and the tailer → scanner loop
+- `hub/`: Only ingestion servers, API auth, retention, SPA serving —
+  no classification or filtering logic
+- `agent/`: Only metric/log collection and gRPC forwarding; no identity of
+  its own beyond its API key
+- `tui/`: Only rendering and key handling; data via the `LogDataSource` trait
 - `db/`: Only data persistence
-- `alerting/`: Only alert rule evaluation
+- `service_tracker/`: Only systemd service management (not yet wired)
+- `alerting/`, `system_monitor/`: Reserved, not yet implemented
 
 ### Dependency Injection via Traits
 
@@ -79,15 +87,26 @@ let scanner = Scanner { parser: NginxAccessParser };
 ## File Organization
 
 ```
+proto/sentinel.proto  # gRPC contract (tonic-build via build.rs)
+migrations/           # Postgres schema (sqlx)
+web/                  # React SPA dashboard (Vite; served by the hub)
 src/
-├── main.rs           # Entry point, DI wiring only
+├── main.rs           # CLI entry: mode flags + hub-key subcommand
 ├── lib.rs            # Public API, module declarations
 ├── config.rs         # Configuration types and loading
 ├── error.rs          # All error types
-└── <domain>/
-    ├── mod.rs        # Module public API
-    ├── <component>.rs # Single responsibility
-    └── tests.rs      # Integration tests (if needed)
+├── setup.rs          # Tracing init, config loading
+├── daemon/           # Daemon mode (process supervision, scan loop)
+├── db/               # Pool + repositories
+├── log_scanner/      # Tailer, parsers, filter, classifier, pipeline
+├── hub/              # gRPC/REST servers, auth, retention, keys CLI
+├── agent/            # Metrics, Docker logs, batched gRPC forwarding
+├── service_tracker/  # Systemd discovery/monitor/journalctl (unwired)
+└── tui/              # ratatui interface
+    └── <domain>/
+        ├── mod.rs    # Module public API
+        ├── <component>.rs # Single responsibility
+        └── tests.rs  # Integration tests (if needed)
 ```
 
 ## Git Workflow
@@ -104,3 +123,8 @@ src/
 - Use constant-time comparison for auth tokens
 - Bind API to localhost by default
 - TLS for all API communication
+- The API key IS the identity: the `api_keys` row carries the trusted
+  `agent_id`/`hostname`/`app_name` and permissions. Never add identity
+  fields to the wire protocol (see HUB_PLAN.md "Security Model")
+- Raw API keys are printed once at creation and stored only as an argon2
+  hash plus the public `key_id` lookup prefix
