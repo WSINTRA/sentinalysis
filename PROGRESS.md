@@ -9,7 +9,7 @@ several SPEC feature areas remain unbuilt (see Gaps below).
 
 ### Completed
 
-- [x] Project documentation (SPEC.md, PLAN.md, AGENT.md, PROGRESS.md, README.md)
+- [x] Project documentation (SPEC.md, PLAN.md, AGENTS.md, PROGRESS.md, README.md)
 - [x] Error types (src/error.rs), configuration loading (src/config.rs)
 - [x] Parsers: NginxAccessParser (now extracts `$host` vhost + `$request_time`), AuthLogParser
 - [x] NoiseFilter: health checks, static assets, known bots (src/log_scanner/filter.rs)

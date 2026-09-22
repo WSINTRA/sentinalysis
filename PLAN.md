@@ -2,7 +2,7 @@
 
 ## Phase 1: Foundation (Complete)
 
-- [x] Create project documentation (SPEC.md, PLAN.md, AGENT.md, PROGRESS.md)
+- [x] Create project documentation (SPEC.md, PLAN.md, AGENTS.md, PROGRESS.md)
 - [x] Initialize Rust project with cargo
 - [x] Configure dependencies in Cargo.toml
 - [x] Git init

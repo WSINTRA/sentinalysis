@@ -230,7 +230,7 @@ src/
 - [SPEC.md](SPEC.md) — Full feature specification
 - [PLAN.md](PLAN.md) — Implementation plan and phases
 - [PROGRESS.md](PROGRESS.md) — Current development status
-- [AGENT.md](AGENT.md) — Development guidelines and conventions
+- [AGENTS.md](AGENTS.md) — Development guidelines and conventions
 
 ## Tech Stack
 

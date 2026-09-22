@@ -1,4 +1,4 @@
-# AGENT.md - Sentinel Development Guidelines
+# AGENTS.md - Sentinel Development Guidelines
 
 ## Project Overview
 
